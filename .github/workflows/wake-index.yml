@@ -14,9 +14,16 @@ name: wake-index
 # ----------------------------
 # 早先的写法是「把上游快进到本 fork，再让索引读本 fork」，但那样**永远无法快进**：
 # 本仓库必须存放这个 workflow 文件，于是 fork 总比上游多一个 commit，
-# 快进关系恒不成立。所以改成：
+# 快进关系恒不成立（实测报「已分叉」）。所以改成：
 # - **检测源仍是上游镜像** `iJetLi/dsh-providers-hub`（索引已按此配置）；
 # - 本 fork 只当**哨兵**，不参与内容分发，也就不会和上游产生分叉冲突。
+#
+# ⚠️ 关于 raw 缓存
+# ----------------
+# 判定「索引是否已收录」时**不能**用 `raw.githubusercontent.com`：
+# 实测 push 后 raw 仍返回旧内容（CDN + GitHub 自身缓存），
+# 会把「索引已落后」误判成「已是最新」，从而漏掉唤醒。
+# 这里用 contents API（带 `ref` 与缓存抑制头），并额外加一个时间容差。
 #
 # 需要的 secret
 # -------------
@@ -55,11 +62,15 @@ jobs:
             "https://api.github.com/repos/${UPSTREAM}/commits/master" | jq -r '.sha')
           echo "上游 HEAD: $upstream_sha"
 
-          # 索引里该插件最新一条的 commit；取不到（网络抖动 / 格式变动）就当作「需要唤醒」，
-          # 因为多发一次 dispatch 只是让索引多跑一次幂等同步，代价远小于漏掉更新。
-          indexed_sha=$(curl -sSf "https://raw.githubusercontent.com/${INDEX}/master/plugin-market.json" \
+          # 用 contents API 而不是 raw：raw 有 CDN 缓存，会读到 push 前的旧内容。
+          # 取不到（网络抖动 / 格式变动）时按「需要唤醒」处理 ——
+          # 多发一次 dispatch 只是让索引多跑一次幂等同步，代价远小于漏掉更新。
+          indexed_sha=$(curl -sSf -H 'Accept: application/vnd.github+json' \
+            -H 'Cache-Control: no-cache' \
+            "https://api.github.com/repos/${INDEX}/contents/plugin-market.json?ref=master" \
+            | jq -r '.content' | base64 -d \
             | jq -r --arg name "$PLUGIN" \
-              '.plugins[] | select(.name==$name) | .versions[0].source.commit' 2>/dev/null || echo '')
+                '.plugins[] | select(.name==$name) | .versions[0].source.commit' 2>/dev/null || echo '')
           echo "索引已收录: ${indexed_sha:-<读取失败>}"
 
           echo "sha=$upstream_sha" >> "$GITHUB_OUTPUT"
