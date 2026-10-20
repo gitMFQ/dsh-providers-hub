@@ -32,6 +32,7 @@ import { Context } from '@deepseek-ai/cordis'
 import { describe, expect, it, vi } from 'vitest'
 import { AccountPool } from '../../src/account-pool.js'
 import { registerJetHubRpc, JET_HUB_API_PATH } from '../../src/jet-hub-rpc.js'
+import { markLoginNeedsExternalAction } from '../../src/login-failure.js'
 
 type Handler = (request: Request) => Promise<Response>
 
@@ -276,7 +277,14 @@ function nextOfficeAceCredential(): Record<string, unknown> {
  */
 function officeaceStub(options: {
   code?: string | undefined
-  completeLoginThrow?: string
+  /**
+   * 非空 ⇒ 交换阶段抛这个错（issue 附件的真实触发形态）。
+   *
+   * ⚠️ 支持传 **Error 实例**（2026-10-20）：用来模拟**带「出路在外部」标记**的真实错误
+   * （`officeace-auth.ts` 的未开通分支就是那样抛的）。传字符串时按普通 `Error` 处理
+   * ⇒ 既有用例行为**逐字不变**。
+   */
+  completeLoginThrow?: string | Error
 }): Record<string, unknown> {
   // ⚠️ 不能写成 `const { code = 'stub-code' } = options`：那样
   //    `{ code: undefined }`（=「用户还没授权」）会**命中默认值**，
@@ -294,7 +302,11 @@ function officeaceStub(options: {
     }),
     pollLoginCode: async () => code,
     completeLogin: async () => {
-      if (completeLoginThrow !== undefined) throw new Error(completeLoginThrow)
+      if (completeLoginThrow !== undefined) {
+        throw typeof completeLoginThrow === 'string'
+          ? new Error(completeLoginThrow)
+          : completeLoginThrow
+      }
       return nextOfficeAceCredential()
     },
     persistLogin: async (
@@ -343,6 +355,49 @@ describe('IKLI7J 根因 1：OfficeAce 交换失败必须是可判定的终态', 
     expect(first.value?.success).toBe(false)
     expect(second.value?.success, '第二次轮询不得退化成「进行中」').toBe(false)
     expect(second.value?.error).toBe(first.value?.error)
+  })
+
+  it('★★ 带「出路在外部」标记的失败**不得**加「请重新点击」假出路（2026-10-20 用户报障）', async () => {
+    // ⚠️ 未开通 MaaS 的出路在**果办客户端**（用该账号点「开通」并同意授权）。
+    //    重新点「+ 新建账号」只会重走一遍 OAuth、然后再失败一次 ⇒ 修前
+    //    `loginFailureMessage()` 无条件拼的那半句是**假出路**：它把用户锚在一个
+    //    永远不会成功的动作上，还把内层唯一有用的指路冲淡了。
+    const h = makeHarness({
+      officeace: officeaceStub({
+        completeLoginThrow: markLoginNeedsExternalAction(new Error(
+          '华为云未返回 MaaS 凭据：该账号尚未开通 ModelArts MaaS。'
+          + '请先用该账号在果办客户端里点「开通」并同意授权，再回来重试。',
+        )),
+      }),
+    })
+    const created = await h.call('account.create', { provider: 'officeace' })
+    const polled = await h.call('login.poll', {
+      accountId: created.value?.accountId as string,
+      provider: 'officeace',
+    })
+    const error = String(polled.value?.error)
+    expect(error, '内层指路（去哪＋做什么）必须完整保留').toContain('果办客户端')
+    expect(
+      error,
+      '⚠️ 不得再拼「请重新点击「+ 新建账号」」—— 那是假出路（开通只能在果办里做）',
+    ).not.toContain('请重新点击')
+  })
+
+  it('★ 反向：**未标记**的失败必须照旧带「请重新点击」后缀（防「一律不加」式误改）', async () => {
+    // ⚠️ 网络抖动 / 用户自己关掉弹窗这类失败，**重试正是出路** ⇒ 后缀必须保留。
+    //    没有这一条，把 `loginFailureMessage` 改成「永不加后缀」也能全绿。
+    const h = makeHarness({
+      officeace: officeaceStub({ completeLoginThrow: '网络超时，请重试' }),
+    })
+    const created = await h.call('account.create', { provider: 'officeace' })
+    const polled = await h.call('login.poll', {
+      accountId: created.value?.accountId as string,
+      provider: 'officeace',
+    })
+    expect(
+      String(polled.value?.error),
+      '未标记的失败仍须给出「重新点击新建账号」这条重试指引',
+    ).toContain('请重新点击')
   })
 
   it('★ 失败后不留幽灵账号：占位条目必须被删掉', async () => {

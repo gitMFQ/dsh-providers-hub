@@ -56,7 +56,22 @@ describe('账号池读写方法', () => {
     }
   })
   it('读方法对缺失字段返回安全默认值（空串 / 0）', () => {
-    expect(pool).toMatch(/opencodeProxy \?\? ''/)
+    /**
+     * ⚠️ 2026-10-18（IKLTZ2 修复期间）：原先断言 `opencodeProxy ?? ''`，
+     * 而读方法已改为 `asProxyText(entry?.opencodeProxy)` —— 因为该字段来自
+     * **用户可编辑的备份文件**，`sanitizeAccounts` 只做 `{...candidate}`
+     * 原样透传、不校验形状 ⇒ 池里可能存在 `"opencodeProxy": 12345`，
+     * 而下游 `normalizeProxy` 第一句就是 `input.trim()` ⇒ 非字符串会抛
+     * `TypeError`，该账号**永久不可用且无自愈**（实测确认）。
+     *
+     * ⚠️ 判据相应改为「过 `asProxyText`」—— 它才是**降级为直连**的那一格。
+     */
+    const proxyAt = pool.indexOf('opencodeProxyFor(')
+    expect(proxyAt, 'opencodeProxyFor 应存在').toBeGreaterThan(-1)
+    const proxyBody = pool.slice(proxyAt, proxyAt + 300)
+    expect(proxyBody, '代理读方法必须过 asProxyText（备份脏值会崩在 input.trim()）')
+      .toMatch(/asProxyText\(/)
+    expect(proxyBody, "不得退回 ?? ''（那对数字脏值同样会崩）").not.toMatch(/\?\? ''/)
     /**
      * ⚠️ **必须切片到方法体内，不能在整份源码上匹配表达式**。
      *

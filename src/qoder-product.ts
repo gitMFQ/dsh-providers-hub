@@ -48,7 +48,31 @@ export interface QoderFallbackModel {
   contextWindow: number
   /** 是否接受图片输入（远端 `is_vl`；实测 17 个全为 true）。 */
   supportsImage?: boolean
-  /** 是否支持思考档位（远端 `is_reasoning`）。 */
+  /**
+   * **请求体 `model_config.is_reasoning` 的原样透传值**（远端目录 `is_reasoning`）。
+   *
+   * ## ⚠️⚠️ 它不是「是否支持思考」的开关 —— 别拿它推 UI
+   *
+   * 上游这两个信号**相互独立**，且经常反向：
+   *
+   * | 信号 | 来源 | 决定什么 |
+   * |---|---|---|
+   * | **思考档位清单** | 目录 `thinking_config.enabled.efforts` 的键 + `disabled` 分支 | **UI 的档位下拉**（`qoderEffortsFor`） |
+   * | **是否真的思考** | 请求体 `parameters.reasoning_effort` + `enable_thinking` | 服务端行为 |
+   * | 本字段 | 目录 `is_reasoning` | **只是**写进 `model_config.is_reasoning` / `chat_context.extra.modelConfig.is_reasoning`，与服务端语义无关（未验证） |
+   *
+   * 实测（2026-10-20，CN `dfmodel`，其 `is_reasoning` = **false**）：我们的链路
+   * 照样出思考，且档位真实生效 —— `reasoning_effort` 取 `max` → **238 字符**
+   * 思考、`low` → **199**、`none` → **0**（关得掉）。
+   *
+   * 客户端源码同款（`qoder-worker-runtime` 的 `fal()`）：`s = r?.is_reasoning ?? false`
+   * → `modelConfig.is_reasoning = s`，之后**只在关掉思考时**把它强制成 `false`
+   * （`(0===thinkingBudget || 'none'===reasoning_effort || false===enable_thinking) && (is_reasoning=false)`），
+   * **从不置 true** ⇒ IDE 对同一个模型发出去的也是 `false`。
+   *
+   * ⇒ 界面上「有档位」与这里 `is_reasoning=false` **不矛盾**，也不该据此把
+   * `efforts` 丢掉（本仓 CN `dfmodel` 就是这么处理的：保留档位、不声明本字段）。
+   */
   supportsThinking?: boolean
   /** 是否免费额度模型（远端 `is_free`）。 */
   isFree?: boolean
@@ -350,7 +374,20 @@ export interface QoderProduct {
    */
   imageMaxBytes?: number
   /**
-   * 模型列表不可用时的兜底模型目录（本插件不发远端请求，恒用它）。
+   * **兜底**模型目录（远端目录取不到时用）。
+   *
+   * ⚠️ **2026-10-20 起它不是线上主路径**：模型列表优先走远端
+   * `/api/v2/model/list?Encode=1`（见 `src/qoder-catalog.ts`），本表只在
+   * 「未登录 / 目录接口故障 / 形状不符」时兜底 —— 与其余 12 家的
+   * `loadCatalog`（远端）/ `syncCatalog`（本表）两段式同形。
+   *
+   * ⚠️ 之所以要改：本表是**编译期快照**（国际版 2026-09-21 / 中国版 2026-09-27），
+   * 而上游改价、改免费额度、上下架模型都不会通知任何人。真实报障
+   * （2026-10-20）：`dfmodel`（DeepSeek-Flash）上游已是 `price_factor = 0` +
+   * `is_free`（IDE 显示 `0.1×` 划掉 `0×`），本表还写着 `0.1`；
+   * `mmodel` 上游已改名 `MiniMax-M3.1-Flash`、倍率 0.1，本表还是 `MiniMax-M2.7` / 0.2。
+   * ⇒ **不要把新采集的值当长期事实填进来**：那只是把快照换新一点，
+   *   下次上游调价仍会腐坏。改这张表只应用来修「远端拿不到时希望看到什么」。
    *
    * ⚠️ **只有模型列表需要 WASM 签名**，不要据此推断其它端点：
    * 推理（`model/v1/chat/completions`）、用户信息（`api/v1/userinfo`）、

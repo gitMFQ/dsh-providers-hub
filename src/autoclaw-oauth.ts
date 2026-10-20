@@ -20,6 +20,7 @@ import {
   calculateAutoclawSign,
   cleanBearerToken,
   autoclawExpiresAtMs,
+  autoclawAccessTokenExpiresAtMs,
   type AutoclawCredential,
 } from './autoclaw.js'
 
@@ -166,9 +167,13 @@ export async function probeAutoclawLocalCredential(options?: {
           (typeof parsed.deviceId === 'string' ? parsed.deviceId : undefined) ??
           (typeof jwtPayload?.device_id === 'string' ? jwtPayload.device_id : undefined)
 
-        const resolvedExpiresAt =
-          (typeof parsed.expiresAt === 'number' ? autoclawExpiresAtMs(parsed.expiresAt) : undefined) ??
-          (typeof jwtPayload?.exp === 'number' ? autoclawExpiresAtMs(jwtPayload.exp) : undefined)
+        // ⚠️⚠️ **JWT 的 `exp` 优先**（2026-10-19 P0）：桌面端凭据里那份
+        //   `expiresAt` 是**它自己写的**，与 token 的真实死线不一定同源；
+        //   而 JWT 的 `exp` 正是网关判定 `410000` 的依据。读不到才回退它。
+        const resolvedExpiresAt = autoclawAccessTokenExpiresAtMs(
+          cleanAccess,
+          typeof parsed.expiresAt === 'number' ? autoclawExpiresAtMs(parsed.expiresAt) : undefined,
+        )
 
         return {
           access_token: cleanAccess,
@@ -252,7 +257,12 @@ export async function refreshAutoclawToken(
 
       const newAccess = cleanBearerToken(json.data.access_token)
       const newRefresh = json.data.refresh_token ? cleanBearerToken(json.data.refresh_token) : cleanRefresh
-      const expiresAt = autoclawExpiresAtMs(json.data.expires_at ?? json.data.expires_in)
+      // ⚠️⚠️ **续期响应同样可能不带 `expires_at` / `expires_in`**
+      //   （2026-10-19 P0）：旧写法在这种情形下产出 `undefined` ⇒
+      //   `syncAccountExpiry` 保留池内旧值（可能就是那份错的），而凭据里也
+      //   读不到真死线。⇒ 一律以 JWT 的 `exp` 为准，声明值只作兜底。
+      const declaredExpiresAt = autoclawExpiresAtMs(json.data.expires_at ?? json.data.expires_in)
+      const expiresAt = autoclawAccessTokenExpiresAtMs(newAccess, declaredExpiresAt)
 
       return {
         access_token: newAccess,
@@ -494,11 +504,23 @@ export async function loginAutoclawWithCode(
 
     const cleanAccess = cleanBearerToken(data.access_token)
     const cleanRefresh = data.refresh_token ? cleanBearerToken(data.refresh_token) : undefined
-    const expiresAt = typeof data.expires_at === 'number'
+    // ⚠️⚠️ **绝不编造过期时间**（2026-10-19 P0，真实报障）。
+    //
+    // 旧实现在上游既不给 `expires_at` 也不给 `expires_in` 时写下
+    // `Date.now() + 7 * 86400_000`（7 天），而真实 access_token 的寿命是
+    // **24 小时**（JWT `iat`→`exp` 实测恒 86400s）⇒ 多出的 6 天让
+    // `refreshAll` 的 lead-time 判据与 `healExpiredAccountBeforeBalance`
+    // 按需自愈**双双跳过**：凭据到期后表现为「刚启动还能看到积分、
+    // 过一会儿变成登录凭据失效」，且**日志零字**；点「刷新积分」也不会自愈。
+    //
+    // ⇒ 权威是 JWT 的 `exp`；退一步用上游声明值；**都读不到就 `undefined`**
+    //   （= 不知道 ⇒ 调用方按「该续期」处理），绝不编数字。
+    const declaredExpiresAt = typeof data.expires_at === 'number'
       ? autoclawExpiresAtMs(data.expires_at)
       : typeof data.expires_in === 'number'
         ? Date.now() + data.expires_in * 1000
-        : Date.now() + 7 * 86400_000
+        : undefined
+    const expiresAt = autoclawAccessTokenExpiresAtMs(cleanAccess, declaredExpiresAt)
 
     const credential: AutoclawCredential = {
       access_token: cleanAccess,

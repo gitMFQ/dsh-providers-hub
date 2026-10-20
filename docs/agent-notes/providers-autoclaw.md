@@ -103,3 +103,101 @@ registry 的 `usesExpiryWindow: true` 只是「把 `windowDays` 回传下去」�
 ⚠️ 但注意：`WIRED_EXPIRY_PROVIDERS` 里 autoclaw 的**注释**声称折算取的是
 「有余额无到期 ⇒ NEVER」（`aggregate-expiry.ts:957-975`）—— 该注释描述的是
 **回退路径**，两种路径都自洽，改动任一侧时同步另一侧的注释。
+
+## ⚠️⚠️⚠️ P0：access_token 的真实死线曾按「编造的 7 天」记录 ⇒ 自动续期与积分自愈全部静默跳过（2026-10-19 真实报障，Gitee IKOYEG）
+
+### 现象（用户原话可复现的时序）
+
+dsh web **启动时还能看到积分**，过一会儿变成「AutoClaw 登录凭据失效，请重新登录」。
+本次实测：dsh web 22:50:41 启动（正常）→ 23:19 面板报错。
+
+### 实测事实（只读 JWT 元数据，**未对真实凭据发起任何续期请求**）
+
+⚠️ **账号一律以「账号 A/B/C」代称**：本次报障涉及用户**真实账号**，而本仓库铁律是
+「注释与用例里的号码一律用**编造的假号** —— 真号会随代码进仓库历史，不可撤回」
+（见 `autoclaw.ts` 的 `autoclawDisplayNickname`）。**连掩码号也不写**：
+掩码保留前 3 位 + 后 4 位，识别力远高于直觉。
+
+| 账号 | JWT `iat` | JWT `exp`（真实死线） | 池/凭据里的 `expires_at` |
+|---|---|---|---|
+| 账号 A | 2026-10-18 23:02:36 | **2026-10-19 23:02:36** | 2026-10-25 23:02:41 |
+| 账号 B | 2026-10-18 23:03:11 | **2026-10-19 23:03:11** | 2026-10-25 23:03:16 |
+| 账号 C | 2026-10-18 23:04:03 | **2026-10-19 23:04:03** | 2026-10-25 23:04:09 |
+
+⇒ access_token **就是明文 JWT**（`user_id/device_id/iat/exp/jti`），寿命恒
+**86400s（24 小时）**，死线一到 `/agent-assetmgr/api/v2/wallets` 立刻回
+`code 410000`（= `autoclaw-credits.ts` 那句「登录凭据失效」）。而
+`expires_at` = 登录时刻 + **恰好 10080 分钟 = 7×86400s**。
+
+### 根因（一条编造的数字，卡死两条链）
+
+`loginAutoclawWithCode` 在上游既不给 `expires_at` 也不给 `expires_in` 时写下
+`Date.now() + 7 * 86400_000`。而这份值同时是**唯一**的续期判据：
+
+| 链 | 读点 | 被跳过的方式 |
+|---|---|---|
+| 定时续期 | `autoclaw-auth.ts` 的 `AUTOCLAW_EXPIRY_ACCESSORS.expiresAtOf` → `shouldRefreshNow` | 判「还有 6 天」⇒ `refreshAll` 每 30 分钟一轮**永远跳过** |
+| 积分按需自愈 | `jet-hub-rpc.ts` 的 `healExpiredAccountBeforeBalance`（`entry.expiresAt <= now`） | 池值说 10月25日 ⇒ **点「刷新积分」也不自愈** |
+
+旁证（决定性）：凭据里的 `iat` 至今仍是登录那一刻 ⇒ **从未续期过一次**。
+症状形态恒定：**过期前不自愈、过期后也不自愈、日志零字**，UI 还显示
+「有效期 10月25日 · 自动续期」（假象）。
+
+### 引入提交与「为什么以前没看到」
+
+- 唯一肇因提交 **`6da5505`**（2026-10-17 00:47，AutoClaw 首次接入）——
+  `git log -S"7 * 86400_000" -- src/autoclaw-oauth.ts` 只命中它，且
+  `git show 6da5505:src/autoclaw-oauth.ts` 里那一行**逐字相同**。
+  ⚠️ **同一次提交**里还写进了 `refreshAccountWithReconcile` 的 lead-time 跳过
+  与 `SELF_HEAL_REFRESHABLE_PROVIDERS` 的登记 ⇒ **上线即带病**，不存在
+  「以前能自愈、后来被改坏」的过渡版本。后续 `13aa60d`（审计）未触碰任何
+  expires 行。
+- 与它无关但易被误认成肇因的两处都更早且对本渠道无语义：
+  `healExpiredAccountBeforeBalance` = `0523e74`（10-10）、
+  `shouldRefreshNow` = `48b2570`（09-28）；`577b27a`（10-18）给 CodeArts 补的
+  refresh 寿命腿 autoclaw 未提供 ⇒ 零行为变化。
+- 没被更早发现的原因是**物理上只到过这一次死线**：provider 10-17 才进仓库，
+  池内账号建于 10-18 23:02 ⇒ 首次死线就是 10-19 23:02。且症状**每 24 小时
+  必然复发**，而「手动修法」（重新登录）会重写 `createdAt` 与假有效期、
+  把死线顺延并把证据一起重置（≈ 每次报障都自动销毁现场）。
+
+### 修法（同一真源，三条腿）
+
+1. `src/autoclaw.ts` 新增 `autoclawJwtExpiresAtMs`（读 JWT `exp`，**不验签**：
+   网关自己也只按 `exp` 判）与 `autoclawAccessTokenExpiresAtMs`
+   （**JWT 优先，声明值兜底**）；
+2. 三个写入点（`loginAutoclawWithCode` / `refreshAutoclawToken` /
+   `probeAutoclawLocalCredential`）与解析点 `parseAutoclawCredential` 共用它；
+   **删除 7 天编造** ⇒ 两者都读不到时返回 `undefined`（= 不知道），由
+   `shouldRefreshNow(undefined) === true` 放行续期（宁可多刷一次，不可编造）；
+3. ⚠️ **纠正点必须是「每次 parse」**：存量坏凭据躺在用户目录里不会自己变，
+   parse 一返回真死线，下一轮 `refreshAll` 立刻放行 ⇒ **无需重新登录**即自愈
+   （成不成取决于 refresh_token 是否仍被上游接受；不成会按既有终态逻辑
+   标 `refreshable:false` 并提示重登）。
+
+### 守卫与变异验证（2026-10-19 实测，本仓库纪律）
+
+新增 8 条用例（`tests/unit/autoclaw.spec.ts` 的「★★ access_token 死线以 JWT 为准」
+与登录/续期路径），并与既有 `isAutoclawTokenExpired` 用例互补。变异验证归因：
+
+| 变异 | 结果 | 结论 |
+|---|---|---|
+| M1：砍掉 `autoclawAccessTokenExpiresAtMs` 的 JWT 腿（`return declaredExpiresAtMs`） | **6 条红** | JWT 权威这条腿有牙 |
+| M2：在 `loginAutoclawWithCode` 恢复 `Date.now() + 7 * 86400_000` | **仅 1 条红**（「两者都没有时必须是 undefined」） | ⚠️ 删除兜底这条腿**只**由那一条守着；JWT 那几条**抓不到**它（因为 JWT 优先会掩盖兜底）⇒ 两条腿的守卫不可互相替代 |
+
+⚠️ 还修了一处**零判别力的旧断言**：原用例只写
+`expect(cred.expires_at).toBeGreaterThan(Date.now())`，对「+7 天编造」**恒真**
+（本次同时补上「差值必须 < 2 天」的量级断言）。这正是缺陷当初漏过测试的地方。
+
+### 未验证项（如实登记）
+
+- **续期端点是否仍接受这批 refresh_token**：未测。本仓库红线是
+  「诊断脚本不得对真实凭据发起 refresh」（曾因此烧掉两个真实账号）
+  ⇒ 只能由修复后插件的正常 `refreshAll` 去试，其终态由既有逻辑表达。
+- **桌面端一键导入路径**（`probeAutoclawLocalCredential`）改为 JWT 优先后，
+  若桌面端自写的 `expiresAt` 与 JWT `exp` 不一致，现以 JWT 为准 ——
+  本机未登录桌面端，**未真机取证**。本次三个坏账号走的是短信登录路径
+  （`expires_at` = 登录时刻 +7 天 ⇒ 该路径不经过 JWT 解析），故与本项无关。
+- `parseAutoclawCredential` 里 `expires_in`（相对秒数）分支仍以**读取时刻**
+  为基准换算 ⇒ 若某天有实现把相对秒数写进凭据，每次读取都会往后平移。
+  当前落盘的是绝对毫秒 `expires_at`，**未触发**，故未改（不扩大范围）。

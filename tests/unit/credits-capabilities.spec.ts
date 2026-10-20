@@ -62,6 +62,12 @@ describe('积分能力矩阵', () => {
     expect(supportsDailyCheckin('buddy')).toBe(true)
   })
 
+  it('AStudio 余额与签到都支持（微信扫码登录与每日奖励弹窗签到）', () => {
+    expect(CREDITS_CAPABILITIES.astudio).toEqual({ balance: true, dailyCheckin: true })
+    expect(supportsCreditBalance('astudio')).toBe(true)
+    expect(supportsDailyCheckin('astudio')).toBe(true)
+  })
+
   it('WorkBuddy 国际版支持余额但不支持签到（余额与签到是彼此独立的能力）', () => {
     // 这条断言专治「因为国际版没有签到，就推断也查不到余额」的错误推断。
     expect(supportsCreditBalance('workbuddy')).toBe(true)
@@ -296,11 +302,11 @@ describe('模型限流按钮门控（重测 / 重置）', () => {
     expect(supportsRateLimit('不存在的 provider')).toBe(true)
   })
 
-  it('登记 false 的都是「按钮语义管辖不到」的渠道（当前恰好四个）', () => {
+  it('登记 false 的都是「按钮语义管辖不到」的渠道（当前恰好五个；accio 2026-10-18 退出、astudio 加入）', () => {
     const disabled = Object.entries(RATE_LIMIT_CAPABILITIES)
       .filter(([, caps]) => caps.rateLimit === false)
       // ⚠️⚠️ **必须减去「产品取舍」那一类**（2026-10-17）：`rateLimit: false` 有
-      //    **两种**不同源，混在一起数会把不变式变成「四个」这个必然腐坏的快照：
+      //    **两种**不同源，混在一起数会把不变式变成「五个」这个必然腐坏的快照：
       //      ① 「按钮语义管辖不到」（本条断言的对象）—— 点了也没用；
       //      ② 「用户刻意不要这个按钮」（能力齐全、入口关闭，见下）。
     //    ⚠️ 魔搭属第 ② 类：它**确实会写** `modelRateLimits`、也**确实**注入了
@@ -308,13 +314,27 @@ describe('模型限流按钮门控（重测 / 重置）', () => {
       .filter(([id]) => !RATE_LIMIT_OFF_BY_CHOICE.has(id))
       .map(([id]) => id)
       .sort()
-    // 四家 rationale 各不相同（registry 里各有字段注释）：
-    // - accio：**不写 modelRateLimits 且不在 probeById 里** ⇒ 两个按钮恒为惰性
-    //   （点了零请求、零清除，用户会以为按钮坏了）；
+    // 五家 rationale 各不相同（registry 里各有字段注释）：
+    // - astudio（**本 fork**）：**不写 modelRateLimits 且不在 probeById 里**
+    //   ⇒ 两个按钮恒为惰性（点了零请求、零清除，用户会以为按钮坏了）。
+    //   `astudio-adapter.ts` 同款：刻意不进 src/index.ts 的 probeById ——
+    //   那张表被守卫锁成「恰好是会写标记的家」，硬塞进去会让守卫红 ⇒ 恒惰性。
+    //   ⚠️ 将来接上请求级换号 + 冷却时，必须**同时**改回 true 并进
+    //   probeById + WRITES_RATE_LIMIT_PROVIDERS（三处同改，由
+    //   provider-runtime-wiring.spec.ts 双向比对锁死）；
+    // - autoclaw：与 astudio **同族**（刻意不做请求级换号 + 冷却，
+    //   同样不进 `probeById`）⇒ 同样恒为惰性；
     // - gemini / officeace：限流由服务端配额管理，本地标记清掉 / 重测通过
     //   都恢复不了配额；
     // - loomy：根本不返回限流错误。
-    expect(disabled).toEqual(['accio', 'autoclaw', 'gemini', 'loomy', 'officeace'])
+    //
+    // ⚠️⚠️ **accio 曾在这条断言里，2026-10-18 因 issue IKM3ZV 退出**：
+    //   它当时的归类是「不写 modelRateLimits 且不在 probeById 里 ⇒ 按钮恒为惰性」
+    //   —— 即第 ① 类「管辖不到」。接上请求级换号 + 冷却（真的会写标记）且
+    //   `probeById` 已登记后，那条理由**不再成立**，故它整体移出
+    //   `rateLimit: false`（既不在①、也不在② 的「产品取舍」表里 ——
+    //   它是**真的可用**，不是「不要这个按钮」）。
+    expect(disabled).toEqual(['astudio', 'autoclaw', 'gemini', 'loomy', 'officeace'])
   })
 
   it('★ 「产品取舍」那一类也必须被点名（不得悄悄混进「管辖不到」里）', () => {

@@ -60,7 +60,7 @@ import { RACCOON } from './raccoon-product.js'
 import { TRAE } from './trae-product.js'
 import { fetchClineCreditBalance } from './cline-credits.js'
 import { claimCodeArtsDailyCheckin, fetchCodeArtsAccountInfoDetailed } from './codearts-credits.js'
-import { fetchGeminiCreditBalance } from './gemini-credits.js'
+import { fetchGeminiCreditBalance, type GeminiCreditOptions } from './gemini-credits.js'
 import { claimLobsteraiDailyCheckin, fetchLobsteraiCreditBalance } from './lobsterai-credits.js'
 import { claimLoomyDailyQuota, fetchLoomyCreditBalance } from './loomy-credits.js'
 import {
@@ -74,6 +74,7 @@ import { fetchModelscopeBalanceDetailed } from './modelscope-credits.js'
 import type { ModelscopeCredential } from './modelscope.js'
 import { MODELSCOPE } from './modelscope-product.js'
 import { fetchAccioBalanceDetailed } from './accio-credits.js'
+import { fetchAstudioBalanceDetailed, claimDaily } from './astudio-credits.js'
 import { fetchAutoclawBalanceDetailed, claimAutoclawDailyQuota } from './autoclaw-credits.js'
 import { fetchTraeCreditBalance, claimTraeDailyCheckin, fetchTraeCheckinStatus } from './trae-credits.js'
 import { collectBuddyGrowth } from './buddy-growth.js'
@@ -90,6 +91,7 @@ import {
 import type { ProviderCredits } from './provider-runtime.js'
 import type { CodeArtsCredential, RpcCreditsBalanceExtra } from './types.js'
 import type { AccioCredential } from './accio.js'
+import type { AstudioCredential } from './astudio.js'
 import type { AutoclawCredential } from './autoclaw.js'
 import type { ClineCredential } from './cline.js'
 import type { GeminiCredential } from './gemini.js'
@@ -98,6 +100,7 @@ import type { LoomyCredential } from './loomy.js'
 import type { MinimaxCredential } from './minimax.js'
 import type { RaccoonCredential } from './raccoon.js'
 import type { TraeCredential } from './trae.js'
+import { participateTraeLottery } from './trae-lottery.js'
 import type { ZcodeCredential } from './zcode.js'
 
 /**
@@ -139,6 +142,17 @@ export interface ProviderCreditsDeps {
    * `minimaxintl` 生效** —— 判据在 `minimaxHeadersFor` 里按 product id 分流。
    */
   readonly minimaxXff?: () => string | undefined
+  /**
+   * Gemini 的**按账号 fetcher**（Gitee issue IKLTZ2）。
+   *
+   * ⚠️ Gemini 的配额端点（`retrieveQuotaSummary`）在墙外，而积分行是**用户
+   * 点一下就等**的主路径：不接代理时它恒报「配额查询网络失败：fetch failed」，
+   * 且**零线索**指向代理。
+   *
+   * ⚠️ 与其余各家同理，必须**惰性**调用（按 `accountId` 现取），不能在注册时
+   * 固化成一份 fetcher —— 账号可能随时在面板里改代理。
+   */
+  readonly geminiFetchFor?: (accountId: string) => typeof fetch
 }
 
 /**
@@ -211,6 +225,41 @@ function ok(balance: CreditBalance): { balance: CreditBalance } {
 /** 组装一条「查不到」的带原因结果（`error` 必须是可读原因，不是 0）。 */
 function fail(error: string): { balance: null; error: string } {
   return { balance: null, error }
+}
+
+/**
+ * TRAE：在**签到收尾**参与 1024 打卡抽奖，并把结果压成**一句话提示**。
+ *
+ * ## ⚠️⚠️ 三条纪律（每条对应一次真实事故或实测）
+ *
+ * 1. **绝不影响签到成败**：抽奖是不可逆写操作，且会因「今日已参与」「不在活动期」
+ *    「无资格」失败 —— 那些都**不是**签到失败。故本函数**永不抛**，只回提示或 `undefined`。
+ *    （本仓库有两轮「登录成功却因记账失败被报成失败」的事故史。）
+ * 2. **不该抽时零请求、零提示**：判定为 `skipped`（已抽过 / 窗口外 / 无资格）时
+ *    返回 `undefined` ⇒ 调用方不追加任何文案（那是「本来就不该抽」，报出来是噪声）。
+ * 3. **奖品如实转述**：真机抽到的是**券**（`prize_text: "AI Build 专属抵扣券"`
+ *    + `coupon_face_amount_fen: 1000`），**没有** `credits` 字段 ⇒ 只用积分数会让
+ *    「抽到券」退化成「所得未知」，把已知信息白丢。
+ *
+ * ⚠️ 内部三道闸门见 `trae-lottery.ts`（先读状态 → 只对 `participate` 发请求 → **不重试**）。
+ */
+async function runTraeLotteryForUi(credential: TraeCredential): Promise<string | undefined> {
+  try {
+    const result = await participateTraeLottery(credential, TRAE)
+    if (result.kind === 'ok') {
+      if (result.prizeText !== undefined) return `1024 打卡抽奖：${result.prizeText}`
+      if (result.credits !== undefined) return `1024 打卡抽奖：${result.credits} 积分`
+      return '1024 打卡抽奖：已参与（所得以 IDE 面板为准）'
+    }
+    if (result.kind === 'failed') {
+      // ⚠️ 服务端文案如实透传（「今日已参与」之类是唯一线索，不得替换成通用话术）。
+      return `1024 打卡抽奖未成功：${result.message ?? result.reason ?? '未知原因'}`
+    }
+    return undefined
+  } catch {
+    // 抽奖的任何异常都不得上抛（见纪律 1）。
+    return undefined
+  }
 }
 
 /**
@@ -312,6 +361,21 @@ export function createProviderCredits(
           call.accountPool.traeCheckinDeviceGenerationFor(entry.id),
           (next) => call.accountPool.updateTraeCheckinDeviceGeneration(entry.id, next),
         ),
+      /**
+       * ★★ **签到收尾顺带参与 1024 打卡抽奖**（2026-10-20 用户指定：
+       *    「点签到按钮时触发」）。
+       *
+       * ## ⚠️⚠️ 为什么**不能**挂在 `claim` 里（第一版就是这么写的，实测失效）
+       *
+       * 本家 `precheckStatus: true` ⇒ `credits.claimAll` 会**先查状态**，
+       * 今天已签到就直接回 `already-claimed`、**根本不调 `claim`**。
+       * 而「已签到」恰恰是最该抽奖的时机（签到后才解锁抽奖）
+       * ⇒ 挂在 claim 内等于**几乎永不触发**。
+       * 用户实测：4 个账号全显示「今天已签到」，一条抽奖信息都没有。
+       *
+       * ⇒ 改挂 `afterClaimNote`：它对 `claimed` **与** `already-claimed` 都会跑。
+       */
+      afterClaimNote: (credential) => runTraeLotteryForUi(credential as TraeCredential),
       precheckStatus: true,
     },
 
@@ -443,6 +507,35 @@ export function createProviderCredits(
     },
 
     /**
+     * AStudio（讯飞 AstronStudio）：额度来自账号后端
+     * `GET /xingchen-studio/points/balance`，只认 Cookie 的 ssoSessionId。
+     *
+     * ⚠️ 同样**必须用 `fetchBalanceDetailed`**（不是 `fetchBalance`）：三类失败的
+     * 用户动作完全不同 —— 会话失效（HTTP 恒 **200** + `code=80000`，唯一出路是去
+     * 客户端**人工重登**，实测无程序化续期接口）/ 服务不可用（可重试，**不得**报成
+     * 需重登，那会让用户白重登一次）/ 响应里没有 `totalBalance`（上游形状变了）。
+     * 查不到时由 `astudio-credits.ts` 返回 `null` + 原因，**绝不写成 0**。
+     *
+     * ⚠️ **签到已接入**（2026-10-16 推翻早期「AStudio 无签到端点」的推论）：
+     * `client-popups/pending` 取待领弹窗（`DAILY_REWARD_DIALOG` / `NEW_USER_DIALOG`）
+     * → `client-popups/complete` 领取，实现在 `astudio-credits.ts` 的 `claimDaily`，
+     * 事实登记见 `docs/agent-notes/providers-astudio.md` §3。
+     * 能力矩阵因此是 `dailyCheckin: true`（`provider-registry.ts:460`），
+     * 客户端**会**渲染「一键领取积分」。
+     *
+     * ⚠️ 本条曾写作「**刻意不提供 `claim`**……能力矩阵里 `dailyCheckin: false`
+     * ⇒ 客户端根本不渲染」——那是被本 PR 自己的文档 §3 推翻的**旧结论残留**，
+     * 与紧邻的实现（下面的 `claim`）**逐字相反**。2026-10-18 审计订正。
+     */
+    astudio: {
+      fetchBalanceDetailed: async (credential) =>
+        await fetchAstudioBalanceDetailed(credential as AstudioCredential),
+      claim: async (credential) =>
+        await claimDaily(credential as AstudioCredential),
+      precheckStatus: false,
+    },
+
+    /**
      * ZCode：额度单位是 **token**（不是积分）。`balance: null` 表示**查不到**
      * （不显示成 0，0 是「已用光」的语义）。
      */
@@ -568,9 +661,20 @@ export function createProviderCredits(
      * 面板不渲染那一行（**不是错误**）。
      */
     gemini: {
-      fetchBalanceDetailed: async (credential) => {
+      fetchBalanceDetailed: async (credential, call) => {
+        const accountId = call?.accountId
+        // ⚠️ **省略 fetcher 时恒直连**（缺 `geminiFetchFor` 的单测与兜底），
+        // 这里只在解析器在场且拿到了账号 id 时传 —— 保持「三者都没传时逐字
+        // 等价」的既有约定（不少单测只注入 credential）。
+        // ⚠️ 必须**先建对象再展开**：三元里的条件表达式直接展开会得到
+        // `{} | {fetcher}` 联合类型，tsc 判它不可迭代（TS2488）。
+        const creditOptions: GeminiCreditOptions = (
+          deps.geminiFetchFor === undefined || accountId === undefined || accountId === ''
+            ? {}
+            : { fetcher: deps.geminiFetchFor(accountId) }
+        )
         const { balance, error, tier } = await fetchGeminiCreditBalance(
-          credential as GeminiCredential, GEMINI,
+          credential as GeminiCredential, GEMINI, creditOptions,
         )
         const extra: RpcCreditsBalanceExtra | undefined = tier === undefined
           ? undefined

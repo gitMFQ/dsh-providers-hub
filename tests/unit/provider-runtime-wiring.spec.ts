@@ -1,5 +1,5 @@
 /**
- * ⚠️ **能力注册表的接线**：`src/index.ts` 真的把 13 个 auth 接到了**对的** provider id 上。
+ * ⚠️ **能力注册表的接线**：`src/index.ts` 真的把 14 个 auth 接到了**对的** provider id 上。
  *
  * ## 与 `jet-hub-rpc-auth-wiring.spec.ts` 的分工（**别把两者合并**）
  *
@@ -50,7 +50,7 @@ import {
 } from '../helpers/provider-sets.js'
 
 /**
- * 13 个**可续期** provider → 它在 `ctx` 上的服务名。
+ * 14 个**可续期** provider → 它在 `ctx` 上的服务名。
  *
  * ⚠️ 两个易错点：
  * - `codearts` 的服务名是 `codeartsAuth`，但 `src/index.ts` 里的**变量名**是 `service`；
@@ -85,7 +85,10 @@ const AUTH_SERVICE_OF: ReadonlyArray<readonly [string, string]> = [
   //    `ctx.officeaceAuth` 注册，故这里与其余渠道同列。
   ['officeace', 'officeaceAuth'],
   ['accio', 'accioAuth'],
-// ⚠️ AutoClaw（智谱）：服务名由 `${product.id}Auth` 派生 ⇒ 全小写 `autoclawAuth`。
+  // astudio 的服务名 = `${product.id}Auth` = `astudioAuth`（与 `src/astudio-auth.ts`
+  // 里 `declare module Context { astudioAuth }` 逐字一致）。
+  ['astudio', 'astudioAuth'],
+  // ⚠️ AutoClaw（智谱）：服务名由 `${product.id}Auth` 派生 ⇒ 全小写 `autoclawAuth`。
   ['autoclaw', 'autoclawAuth'],
   // ⚠️ **本 fork 独有**（modelscope，2026-10-16）。服务名由 `${product.id}Auth`
   //    派生 ⇒ `modelscopeAuth`。同款坑：本表由**真跑 apply() 的探针**验证过，
@@ -140,13 +143,13 @@ describe('★ index.ts 的能力注册表接线（行为断言，替代源码文
    *
    * ⚠️ **必须逐个真调一次**才算证明身份：`runtime.auth.refreshAccount` 是
    *    `index.ts` 里包的闭包，**无法与 ctx 上的实例直接 `toBe` 比较**
-   *   （闭包每次 apply 都是新的）。故做法是：给 13 个服务各装一个 spy，
+   *   （闭包每次 apply 都是新的）。故做法是：给 14 个服务各装一个 spy，
    *    调**某一个** id 的 `refreshAccount`，断言**恰好**它自己的服务被调到。
    *
    * ⚠️ 这一步是**不可替代**的：只断言「refreshAccount 是函数」的版本
    *    在 `['qodercn', qoder]` 错位下**照样全绿** —— 那是同义反复。
    */
-  it('13 个 auth 逐个接到**自己那个** provider id 上（错位即红，且点名是哪个）', async () => {
+  it('14 个 auth 逐个接到**自己那个** provider id 上（错位即红，且点名是哪个）', async () => {
     const ctx = applyOnce()
 
     const spies = new Map<string, ReturnType<typeof vi.spyOn>>()
@@ -179,13 +182,13 @@ describe('★ index.ts 的能力注册表接线（行为断言，替代源码文
   })
 
   it('★ 14 家都挂上了 `auth.refreshAll`（Task 10：漏一家 ⇒ 该家永不自动续期且日志零字）', async () => {
-    // ⚠️ **为什么必须在这里断言**：`refreshTargets` 已从「手抄 13 行」改为
+    // ⚠️ **为什么必须在这里断言**：`refreshTargets` 已从「手抄固定行数」改为
     //    由 `wiredRefreshTargets()` **从注册表派生**。派生函数本身由
-    //    `refresh-targets-derived.spec.ts` 测；**「注册循环真的把 13 家都接上了」
+    //    `refresh-targets-derived.spec.ts` 测；**「注册循环真的把 14 家都接上了」
     //    只能靠真跑 `apply()` 才能证明** —— 这正是本文件的职责。
     //
     // ⚠️⚠️ **遍历 `wiredRefreshTargets()` 的结果，不是手抄清单**：
-    //    我第一版从 `AUTH_SERVICE_OF`（手抄 13 家）遍历，于是「漏挂一家」
+    //    我第一版从 `AUTH_SERVICE_OF`（手抄 14 家）遍历，于是「漏挂一家」
     //    **照样全绿**（实测：把 gemini 从派生表里剔掉，15 passed）—— 那是
     //    **同义反复**。改为遍历**派生结果**后，漏一家会红并点名。
     const ctx = applyOnce()
@@ -363,10 +366,12 @@ describe('★ index.ts 的能力注册表接线（行为断言，替代源码文
     const shouldRegister = expectedProviderIdsWithAuth().sort()
     // ⚠️ 2026-10-13 合并：officeace 与 accio **同一次**并入，故 13 → 15。
     // ⚠️ 2026-10-15 加 minimaxintl（MiniMax Code 国际版）：15 → 16。
-// ⚠️ 2026-10-17 加 autoclaw（第 18）：17 → 18；
-    //    同日 **本 fork** 并入 modelscope（魔搭）：18 → 19 个真渠道，
-    //    减去 AUTH_EXEMPT 两项（opencode / aggregate）⇒ 18 个 auth 键。
-    expect(shouldRegister, 'channel 集合变了，请复核 opencode 豁免是否仍成立').toHaveLength(18)
+    // ⚠️ 2026-10-16 并入 astudio：16 → 17。
+    // ⚠️ 2026-10-17 加 autoclaw（第 18）：17 → 18；
+    //    同日 **本 fork** 并入 modelscope（魔搭）：18 → 19；
+    //    再加 astudio（本 fork 与上游各登记一次）⇒ 19 → 20 个真渠道，
+    //    减去 AUTH_EXEMPT 两项（opencode / aggregate）⇒ 19 个 auth 键。
+    expect(shouldRegister, 'channel 集合变了，请复核 opencode 豁免是否仍成立').toHaveLength(19)
     expect(
       registeredRuntimeIds().sort(),
       'registry 里有账号的 provider 必须都注册进能力注册表（左侧多出 = 清单里多了僵尸项，' +
@@ -433,10 +438,15 @@ describe('★ index.ts 的 probe 域接线（Task 8 复审补齐：此前零守�
     // `rateLimit: false`，与 accio 同形）。登记为空是**被验证的声明**，不是
     // 「忘了接」—— 下面那条用例会真去 grep 源码确认确实没有写点。
     ['autoclaw-adapter.ts', []],
-    // accio（Accio 阿里）**不写** `modelRateLimits`：本任务（Task 6）只实现
-    // 目录 / 解析 / 流式，请求级换号与冷却不在范围内。留空是**被验证的声明**
-    // （见下面「登记为不写标记的文件确实没有写点」那条用例）。
-    ['accio-adapter.ts', []],
+    // accio（Accio 阿里）**会写** `modelRateLimits`：2026-10-18 的 issue IKM3ZV
+    //    给它接上请求级换号 + 冷却后（额度至 UTC+8 当日 24:00 / 限流 1h）。
+    //    ⚠️ 它**曾**登记为 `[]`（不写标记）—— 下面那条「登记为不写标记的确实没有
+    //    写点」用例就是靠这个变化**红**出来的，与 minimax 2026-10-11 那次同型。
+    ['accio-adapter.ts', ['accio']],
+    // ⚠️ astudio **不写** `modelRateLimits`（`astudio-adapter.ts` 实测零处
+    //    `markLimited` / `updateModelRateLimit`）：限流与额度由讯飞 MAAS 侧按账号
+    //    配额管理，本地标记清不掉配额（与 officeace 同因）。留空是**被验证的声明**。
+    ['astudio-adapter.ts', []],
   ]
 
   /**
@@ -617,6 +627,72 @@ describe('★ index.ts 的 probe 域接线（Task 8 复审补齐：此前零守�
       expect(calls[0]?.auth).toBe('Bearer tok-probe-minimax')
       expect(calls[0]?.url).toBe(`${MINIMAX.apiHost}/mavis/api/v1/llm/v1/messages`)
       // ② 402 原样透出（探测靠它判「额度类失败」并决定是否保留标记）
+      expect(error).toMatchObject({ code: 'QUOTA_EXCEEDED' })
+    } finally {
+      globalThis.fetch = originalFetch
+      vi.unstubAllGlobals()
+    }
+  })
+
+  /**
+   * ★★ **probeById.accio 的同款守卫**（2026-10-18 审计补齐，Issue IKM3ZV）。
+   *
+   * ## 为什么必须补（同一个坑的第二家）
+   *
+   * minimax 那条上面已写明：`account-probe-adapter.spec.ts` 用的是 `vi.mock` 的
+   * **桩**适配器（`stream()` 直接抛错、**完全不读凭据**）⇒ 「工厂把传入的凭据
+   * 真的接到了请求上」这件事**零覆盖**。
+   *
+   * ⚠️⚠️ **实测（2026-10-18 对抗审计变异验证）：把 accio 那条工厂的
+   * `resolveCredential: async () => credential as AccioCredential` 改成恒返
+   * `undefined`，全套测试**仍然全绿**。** 生产症状：用户在 Jet Hub 点 accio 账号的
+   * 「重测 / 重测所有」⇒ 探测恒抛 `accio: no usable credential; log in first`
+   * ⇒ **本渠道写进去的 24h / 1h 限流标记永远清不掉**（与 minimax 补测前逐字相同）。
+   *
+   * ⚠️ 第二条更危险：给探测适配器**误加** `accountPool` 也是全绿 —— 探测路径上
+   * 失败会**把被测账号封 24h**，而探测没有任何回滚 ⇒ 点一次「重测」就污染账号池。
+   *
+   * ⇒ 本用例锁三格：① 凭据真的进了 **`body.token`**（⚠️ 本家的令牌走 body、
+   *   **不是** `Authorization` 头 —— 这是 accio 最易错的一条，桩适配器读不出）；
+   *   ② `options.accountPool` 为 `undefined`；③ 402 原样透出 `QUOTA_EXCEEDED`。
+   */
+  it('★★ probeById.accio 用真实适配器：凭据进 body.token、且无池时不换号不写标记', async () => {
+    const calls: Array<{ url: string; token: string | undefined; auth: string | null }> = []
+    const originalFetch = globalThis.fetch
+    vi.stubGlobal('fetch', (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const raw = String(init?.body ?? '{}')
+      let token: string | undefined
+      try { token = (JSON.parse(raw) as { token?: string }).token } catch { /* 非 JSON */ }
+      calls.push({
+        url: String(input),
+        token,
+        auth: new Headers(init?.headers).get('Authorization'),
+      })
+      return new Response('{"error":"insufficient balance"}', {
+        status: 402, headers: { 'content-type': 'application/json' },
+      })
+    }) as typeof fetch)
+    try {
+      const credential = { access_token: 'tok-probe-accio', refresh_token: 'r' }
+      const adapter = probeById['accio']!.createProbeAdapter(
+        'ACCIO_ACCOUNT_TEST', credential as never,
+      )
+      const options = (adapter as unknown as {
+        options: { accountPool?: unknown; fetchRemoteModels?: unknown }
+      }).options
+      expect(options.accountPool, '探测不得持有账号池（否则失败会写回限流标记 → 点一次重测就封账号 24h）')
+        .toBeUndefined()
+      expect(options.fetchRemoteModels, '探测不得为一次存活检查额外拉远端目录').toBeUndefined()
+
+      const error = await adapter.stream({ model: '1Drift-N8kP2Q7wR5mX', messages: [] } as never)
+        .next().then(() => null).catch((e: unknown) => e)
+
+      // ① 凭据真的进了 **body.token**（本家的令牌走 body，放 Authorization 头恒流内 402）
+      expect(calls).toHaveLength(1)
+      expect(calls[0]?.token, '凭据必须进 body.token，否则生产上「重测」恒报未登录')
+        .toBe('tok-probe-accio')
+      expect(calls[0]?.auth, '本家不走 Authorization 头（实测恒流内 402）').toBeNull()
+      // ② 402 原样透出（探测靠它判「额度类失败」）
       expect(error).toMatchObject({ code: 'QUOTA_EXCEEDED' })
     } finally {
       globalThis.fetch = originalFetch

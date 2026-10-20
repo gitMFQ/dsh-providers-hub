@@ -27,7 +27,14 @@ import { describe, expect, it } from 'vitest'
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, resolve } from 'node:path'
-import { AutoAdapter, pickSoonestProvider, priceFactorFromName } from '../../src/auto-adapter.js'
+import {
+  AUTO_CHOICE_TTL_MS,
+  AUTO_MODEL,
+  AUTO_PROVIDER,
+  AutoAdapter,
+  pickSoonestProvider,
+  priceFactorFromName,
+} from '../../src/auto-adapter.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const adapterSource = readFileSync(resolve(here, '../../src/auto-adapter.ts'), 'utf8').replace(/\r\n/g, '\n')
@@ -48,8 +55,17 @@ interface HarnessOptions {
   pool?: { getAvailableAccount: (provider: string, model: string) => Promise<unknown> }
 }
 
-/** 驱动真实 `prepareCall` → `call.stream` 链路，返回实际发往的 `provider/model`。 */
-async function dispatchThrough(options: HarnessOptions): Promise<{ sent: string[]; error?: { code?: string; name?: string } }> {
+/**
+ * 驱动真实 `prepareCall` → `call.stream` 链路，返回实际发往的 `provider/model`。
+ *
+ * ⚠️ `error` 用 `Partial<Error> & { code?: string }` 而不是 `{ code?: string }`：本文件的用例要
+ * 断言 `error.name`（`AbortError` 形态）与 `error.message`（上游 499 报文），只声明
+ * `code` 会让那两条报 `TS2339`（`Property 'name' does not exist`）。用 `Partial<Error>`
+ * 而非 `Error` 是因为抛出来的未必是真 `Error` 实例（本仓库大量抛带 `code` 的普通对象）。
+ */
+async function dispatchThrough(
+  options: HarnessOptions,
+): Promise<{ sent: string[]; error?: Partial<Error> & { code?: string } }> {
   const sent: string[] = []
   const catalogs = options.catalogs ?? {}
   const disabled = options.disabled ?? {}
@@ -321,13 +337,20 @@ describe('★★ auto：胜者必须在将要派发的模型上仍有可用账�
     return { adapter, sent }
   }
 
-  const run = async (adapter: AutoAdapter): Promise<{ code?: string } | undefined> => {
+  /**
+   * 驱动真实链路，只回报**逃出来的错误**。
+   *
+   * ⚠️ 返回类型必须带 `name` / `message`（不能只有 `code`）：本组有两条用例分别断言
+   * `error.name === 'AbortError'` 与 `error.message` 含上游 499 报文，只声明 `code`
+   * 会让那两条报 `TS2339`（本文件不在 `tsconfig.tests.json` 的 include 里，长期未发现）。
+   */
+  const run = async (adapter: AutoAdapter): Promise<Partial<Error> & { code?: string } | undefined> => {
     try {
       const call = await adapter.prepareCall('jet-hub-auto', 'auto')
       for await (const _ of call.stream({ messages: [userMessage()] } as never)) { /* drain */ }
       return undefined
     } catch (error) {
-      return error as { code?: string }
+      return error as Partial<Error> & { code?: string }
     }
   }
 
@@ -614,7 +637,7 @@ describe('★★ auto：零输出撞墙时改道下一个 provider（B 方案）
    * ⚠️ `now` 是**可变**的（返回对象上的 `setNow`），用来验证冷却「到期自动恢复」
    * 与「冷却期内跳过」两种状态 —— 用固定时钟无法区分它们。
    */
-  function makeWorld(loomyChunks: Array<{ type: string; reason?: { kind?: string } }>) {
+  function makeWorld(loomyChunks: TestChunk[]) {
     const sent: string[] = []
     let now = 1_000_000
     const ctx = {
@@ -624,7 +647,7 @@ describe('★★ auto：零输出撞墙时改道下一个 provider（B 方案）
         resolveModelInfo: async (provider: string, id: string) => ({ provider, id }),
         stream: (o: { provider: string; model: string }) => {
           sent.push(`${o.provider}/${o.model}`)
-          const chunks = o.provider === 'loomy'
+          const chunks: TestChunk[] = o.provider === 'loomy'
             ? loomyChunks
             : [
                 { type: 'block-start', index: 0, blockType: 'text' },
@@ -649,12 +672,26 @@ describe('★★ auto：零输出撞墙时改道下一个 provider（B 方案）
     return { adapter, sent, setNow: (v: number) => { now = v } }
   }
 
+  /**
+   * 一个 chunk 的**最小形状**（本文件的判据只读 `type` 与 `reason.kind`）。
+   *
+   * ⚠️ 但真实的 block 帧还带 `index` / `blockType` / `text` 等字段，用例必须能把它们
+   * 传进来 —— 否则「正文 vs 零输出」这一组用例根本表达不出「有输出」。故这里用
+   * 索引签名兜住额外字段（旧写法 `{ type; reason? }` 会让这两条字面量报 `TS2353`；
+   * 本文件不在 `tsconfig.tests.json` 的 include 里，所以一直没被发现）。
+   */
+  interface TestChunk {
+    type: string
+    reason?: { kind?: string }
+    [extra: string]: unknown
+  }
+
   /** 驱动真实链路并收集**最终看到的** chunk 序列。 */
-  async function run(adapter: AutoAdapter): Promise<Array<{ type: string; reason?: { kind?: string } }>> {
-    const seen: Array<{ type: string; reason?: { kind?: string } }> = []
+  async function run(adapter: AutoAdapter): Promise<TestChunk[]> {
+    const seen: TestChunk[] = []
     const call = await adapter.prepareCall('jet-hub-auto', 'auto')
     for await (const chunk of call.stream({ messages: [userMessage()] } as never)) {
-      seen.push(chunk as { type: string; reason?: { kind?: string } })
+      seen.push(chunk as TestChunk)
     }
     return seen
   }
@@ -1033,5 +1070,288 @@ describe('★★ auto：目录契约与 lastDispatch 的 model 字段', () => {
     expect(decided?.provider).toBe('buddy')
     // ⛔ 恒空串时这里是 `''` —— 胶囊会显示「自动 → buddy」而没有模型名。
     expect(decided?.model, '必须记下真实 modelId（不是空串）').toBe('real-model-id')
+  })
+})
+
+/**
+ * ★★ `resolveModel` 不得阻塞模型目录加载（用户报障 2026-10-18：
+ * 「模型选择列表加载了 1 分多钟」）。
+ *
+ * ## 决定性实测证据
+ *
+ * ```
+ * [buildModelCatalog] provider=jet-hub-auto 全部完成：listModels=1ms，总耗时=70770ms，模型数=1
+ * ```
+ *
+ * `listModels` 只花 1ms，**70 秒全在 `resolveModelInfo`**：原实现
+ * `resolveModel()` → `await this.ensureChoice()` → `selectProvider()` → 遍历全池调
+ * `expiryOf` → **每渠道一次余额查询**。而目录加载时选型缓存**必空** ⇒ 每轮全池重算。
+ *
+ * ## 判据的三条纪律（本文件反复踩过）
+ *
+ * 1. **`inputModalities` 断言是恒真的**（降级与真实两条 return 都声明 text+image）
+ *    ⇒ 它只能守「怎么又不支持图片了」，**不能**用来判「走了哪条路径」。判路径必须
+ *    看真实路径独有的指纹：`contextWindow = REAL_INFO_CONTEXT_WINDOW` 与
+ *    `reasoning.efforts`（降级那份是写死的保守窗口且不带档位）。
+ *    两个指纹**必须同时断言**（单指纹会在将来给降级路径补上档位时静默变恒绿）。
+ * 2. **「永不 resolve 的 `expiryOf`」是唯一能证明「没 await 选型」的夹具**
+ *    —— 让余额探测挂住，若实现仍 await 全池选型，`resolveModel` 会一直挂着。
+ * 3. **`now` 注入时钟是本组「把时间推过 TTL」的唯一手段** —— 第 5 条必须在
+ *    不重新选型（`expiryOf` 仍永不 resolve）的前提下让缓存过期。
+ *
+ * ## ⚠️ 本组所有调用都是**零参**
+ *
+ * `AutoAdapter.resolveModel()` 是零参方法（`src/auto-adapter.ts:359`）—— 宿主实际按
+ * 三参调用，但本类刻意全忽略（只有 `auto` 一个对外模型，真实目标由内部选型决定）。
+ * 写成 `resolveModel(AUTO_PROVIDER, AUTO_MODEL, undefined)` 会报
+ * `TS2554: Expected 0 arguments, but got 3`。⚠️ 这个文件**不在**
+ * `tsconfig.tests.json` 的 `include` 里（只有 src + 两个 spec + dsh-host-client），
+ * 所以 `pnpm typecheck` 对本文件**零覆盖力** —— 改动后请单独跑一次：
+ * `npx tsc --noEmit --strict --target ES2022 --module NodeNext --moduleResolution NodeNext
+ * --skipLibCheck tests/unit/auto-adapter.spec.ts`。
+ */
+
+/**
+ * 本组夹具的固定时钟。
+ *
+ * ⚠️ 数字**随常量变化**：选型缓存默认 `AUTO_CHOICE_TTL_MS` = 60 秒 ⇒ 同一时刻两次
+ * 调用必在「新鲜」窗口内。改常量时同改本注释。
+ */
+const AUTO_NOW = 1_000
+
+/**
+ * 目标模型的**真实**窗口 —— 降级路径给不出这个值（它恒是保守字面量 `200_000`，
+ * 见 `src/auto-adapter.ts` 降级 return 处的注释）。
+ *
+ * ⚠️ 本文件的判别力全部依赖这一个不等式：**夹具值 ≠ 生产常量**。若有人把保守窗口
+ * 改成这个数，本组会同时失去判别力 ⇒ 故第 2/3 条只断言这一个不等式（第 2 条断言
+ * `not.toBe(REAL_INFO_CONTEXT_WINDOW)`、第 3 条断言等值），**不要**再把生产常量
+ * 另钉成字面量。
+ *
+ * ⚠️ 数字随常量变化：改 `src/auto-adapter.ts` 的保守窗口时必须检查本组是否仍可分。
+ */
+const REAL_INFO_CONTEXT_WINDOW = 123_456
+
+interface AutoCatalogWorld {
+  /**
+   * provider → 目录。默认只有 `buddy` 有一个模型（其余渠道空目录 ⇒ 不可调用）。
+   *
+   * ⚠️ 渠道必须取自 `AUTO_PROVIDERS`（codearts / loomy / zcode / buddy / workbuddy）
+   * —— 别的 provider（trae / cline / …）**不在候选表里**，选型永远不会走到它们
+   * （本组第一版用 trae，`prepareCall` 直接报「没有已登录的 provider」）。
+   */
+  catalogs?: Record<string, Array<{ id: string; name: string }>>
+  /**
+   * 覆盖临期折算（其余 provider 走默认 `-1` = UNUSABLE）。
+   *
+   * ⚠️ 返回**永不 resolve** 的 promise 是「证明 `resolveModel` 没 await 选型」的关键
+   * 夹具 —— 见上面第 2 条纪律。
+   */
+  expiryOf?: (provider: string, signal?: AbortSignal) => Promise<number>
+  /** 注入的当前时刻（默认 {@link AUTO_NOW}）。第 5 条用它把时钟推过 TTL。 */
+  now?: () => number
+  /**
+   * 选型缓存 TTL。
+   *
+   * ⚠️ **默认不传** ⇒ 用生产默认（`AUTO_CHOICE_TTL_MS`，**数字随常量变化**）：
+   * 「缓存新鲜」与「冷启动」才成为两个不同的世界。
+   * 传 `0` 会让本组第 3、4 条失去意义（缓存永不过期/永不命中都不是要测的形态）。
+   */
+  ttlMs?: number
+  /** 覆写 `ctx.llm.stream` 的 chunk 序列（缺省零输出，够用）。 */
+  streamChunks?: (provider: string) => Array<{ type: string; reason?: { kind?: string } }>
+}
+
+/**
+ * 造一个「目录加载」场景的 auto 夹具。
+ *
+ * ⚠️ 沿用本文件既有夹具的形态（`new AutoAdapter(ctx, { accountPool, now, ttlMs })` +
+ * 覆盖 `expiryOf`），**不新造第二套世界**；只是把「目录 / 临期 / 时钟 / 流」收成选项。
+ *
+ * 默认世界的 `ctx.llm.resolveModelInfo` 返回**带真实能力**的元数据
+ * （`contextWindow = REAL_INFO_CONTEXT_WINDOW` + 两档 reasoning），于是「走了真实
+ * 路径」与「走了降级路径」在**返回值上可区分** —— 这是本组全部判别力的来源。
+ */
+function makeAutoAdapter(world: AutoCatalogWorld = {}): { adapter: AutoAdapter; sent: string[] } {
+  const sent: string[] = []
+  const catalogs = world.catalogs ?? { buddy: [{ id: 'm1', name: 'M1 · x0.5' }] }
+  const ctx = {
+    logger: { warn: () => {}, error: () => {} },
+    llm: {
+      listModels: async (provider: string) => catalogs[provider] ?? [],
+      resolveModelInfo: async (provider: string, id: string) => ({
+        provider,
+        id,
+        name: `real-${id}`,
+        // ⚠️ 真实路径的两个指纹（降级路径恒 `200_000` 且**不带** reasoning）。
+        context: { contextWindow: REAL_INFO_CONTEXT_WINDOW },
+        reasoning: { efforts: [{ id: 'high', name: '高' }, { id: 'low', name: '低' }] },
+      }),
+      stream: (o: { provider: string; model: string }) => {
+        sent.push(`${o.provider}/${o.model}`)
+        const chunks = world.streamChunks?.(o.provider) ?? []
+        return (async function* () { for (const c of chunks) yield c })()
+      },
+    },
+  }
+  const pool = {
+    disabledModelsFor: () => new Set<string>(),
+    getAvailableAccount: async () => ({ entry: { id: 'a1' }, credential: { token: 't' } }),
+  }
+  const adapter = new AutoAdapter(ctx as never, {
+    accountPool: pool as never,
+    now: world.now ?? (() => AUTO_NOW),
+    // ⚠️ 只在用例显式给了 TTL 时才传（见 `AutoCatalogWorld.ttlMs` 的注释）。
+    ...(world.ttlMs === undefined ? {} : { ttlMs: world.ttlMs }),
+  })
+  adapter.expiryOf = world.expiryOf
+    ?? (async (provider: string) => (provider === 'buddy' ? 100 : -1))
+  return { adapter, sent }
+}
+
+describe('auto：目录加载不得被选型阻塞', () => {
+  it('★★ resolveModel 不 await 全池选型（fetch 永不 resolve 也必须返回）', async () => {
+    const never = new Promise<number>(() => {})
+    const { adapter } = makeAutoAdapter({ expiryOf: () => never })
+    // ⚠️ 零参调用：`AutoAdapter.resolveModel()` 刻意不接受宿主的 3 个参数（见 `src/auto-adapter.ts`
+    //    的「为什么是零参签名」）。传 3 参是 `TS2554`，而本文件不在 `tsconfig.tests.json`
+    //    的 include 里 ⇒ `pnpm typecheck` 抓不到，别写回去。
+    const info = await Promise.race([
+      adapter.resolveModel(),
+      new Promise((resolve) => setTimeout(() => resolve('TIMEOUT'), 50)),
+    ])
+    expect(info, '★★ resolveModel 必须不等选型就返回').not.toBe('TIMEOUT')
+    // 返回的必须是 auto 的身份：DSH 的 normalizeModelInfo 校验 provider/id 与路由相符。
+    expect((info as { provider?: string }).provider).toBe(AUTO_PROVIDER)
+    expect((info as { id?: string }).id).toBe(AUTO_MODEL)
+  })
+
+  it('★★ 降级返回的元数据仍声明 image 模态（否则图片能力回退）', async () => {
+    const never = new Promise<number>(() => {})
+    const { adapter } = makeAutoAdapter({ expiryOf: () => never })
+    const info = await adapter.resolveModel()
+    expect(
+      info.inputModalities,
+      '★★ 降级路径也必须恒为 text+image',
+    ).toEqual(expect.arrayContaining(['text', 'image']))
+    // 反向确认本世界**真的走了降级路径**（否则上一条断言的含义就变了）：
+    // 真实路径的指纹不在，只有保守窗口。
+    // ⚠️ 只断言**这一个不等式**（夹具值 ≠ 生产常量），不把生产常量另钉成字面量 ——
+    //    否则「有人把保守窗口改成夹具值」时本条与第 3 条会**同时**变恒绿。
+    expect(
+      info.context?.contextWindow,
+      '冷启动应返回保守元数据（≠ 目标模型的真实窗口）',
+    ).not.toBe(REAL_INFO_CONTEXT_WINDOW)
+  })
+
+  it('★ 有新鲜选型缓存时仍返回真实元数据（降级只作用于冷启动）', async () => {
+    // ⚠️ 反向对照：没有这条，「永远返回降级元数据」也会全绿。
+    const { adapter } = makeAutoAdapter()
+    // ⚠️ 预置选型缓存走**真实链路**：`prepareCall` 内部 `await ensureChoice()` 会把
+    //    `{ choice, info }` 写进缓存 —— 比直接改私有字段更能证明「缓存命中走真路」。
+    await adapter.prepareCall(AUTO_PROVIDER, AUTO_MODEL)
+    const info = await adapter.resolveModel()
+    expect(info.inputModalities, '★ 有缓存时走真实路径').toBeDefined()
+    // ⚠️⚠️ 上面那条**恒真**（两条路径都声明 text+image）⇒ 必须补判别力断言：
+    expect(
+      info.context?.contextWindow,
+      '★ 有缓存时必须是目标模型的真实窗口（降级给不出这个值）',
+    ).toBe(REAL_INFO_CONTEXT_WINDOW)
+    expect(
+      info.reasoning?.efforts?.map((effort) => String(effort.id)),
+      '★ 档位也必须来自目标模型（降级路径不带 reasoning）',
+    ).toEqual(['high', 'low'])
+  })
+
+  /**
+   * ★★ 冷却必须**穿透**「新鲜缓存」（姊妹判据，与 `ensureChoice` 那条同源）。
+   *
+   * 选型缓存时长（`AUTO_CHOICE_TTL_MS`，**数字随常量变化**）而零输出冷却 10 分钟
+   * —— 同步读缓存时若不复核冷却，冷却就被架空：`resolveModel` 会把一个**已确认
+   * 撞墙**的目标当成正常目标向宿主播报。
+   *
+   * ⚠️ 冷却必须由**真实链路**写入（`dispatch` 撞墙后 `noteZeroOutputHit`），
+   *    不直接改私有表：判据要落在「复用 `isTargetCoolingDown` 这唯一权威」上。
+   */
+  it('★★ 缓存项进入零输出冷却后不得再算「新鲜」（否则冷却被选型缓存架空）', async () => {
+    const { adapter, sent } = makeAutoAdapter({
+      catalogs: {
+        buddy: [{ id: 'm1', name: 'M1 · x0.5' }],
+        zcode: [{ id: 'g1', name: 'G1 · x0.8' }],
+      },
+      expiryOf: async (provider: string) => (provider === 'buddy' ? 100 : provider === 'zcode' ? 200 : -1),
+      // `buddy` 收下请求却零输出（issue IKJW31 的失败形态）⇒ 它会被记 10 分钟冷却。
+      streamChunks: (provider: string) => (provider === 'buddy'
+        ? [{ type: 'usage' }, { type: 'finish', reason: { kind: 'max-tokens' } }]
+        : [{ type: 'finish', reason: { kind: 'stop' } }]),
+    })
+
+    // 先走一次真实请求：既把 `buddy/m1` 写进选型缓存，又把它推进冷却。
+    const call = await adapter.prepareCall(AUTO_PROVIDER, AUTO_MODEL)
+    for await (const _ of call.stream({ messages: [userMessage()] } as never)) { /* drain */ }
+    expect(sent, '前置：撞墙后应改道到 zcode').toEqual(['buddy/m1', 'zcode/g1'])
+
+    // 时钟未动 ⇒ 缓存**仍在 TTL 窗口内**，唯一能让它失效的理由就是冷却。
+    const info = await adapter.resolveModel()
+    // ⛔ 不复核冷却时会返回缓存里那份真实元数据（带 reasoning）⇒ 本条变红。
+    expect(info.reasoning, '冷却中的缓存项必须视为过期（降级元数据不带档位）').toBeUndefined()
+    // ⚠️ 双指纹（Minor 1）：只挂 `reasoning` 一个指纹时，将来若给降级路径补上通用档位，
+    //    本条会**静默变恒绿** ⇒ 同时断言保守窗口。
+    expect(
+      info.context?.contextWindow,
+      '冷却中的缓存项必须视为过期（降级元数据的保守窗口指纹）',
+    ).not.toBe(REAL_INFO_CONTEXT_WINDOW)
+    // 但模态声明不受影响（恒为 text+image，见第 2 条）。
+    expect(info.inputModalities).toEqual(expect.arrayContaining(['text', 'image']))
+  })
+
+  /**
+   * ★★ TTL 半零守卫：**第 5 条**（本轮复审补，必修 2）。
+   *
+   * ## 它守的是「两处新鲜度判据必须同源」
+   *
+   * 「缓存是否新鲜」有**两份实现**：`cachedChoiceFresh`（`resolveModel` 用的同步版）
+   * 与 `ensureChoice` 的缓存分支（`prepareCall` 用的异步版）。既有 4 条用例只覆盖了
+   * **冷却**那一条腿（第 4 条），**TTL 那条腿零覆盖** —— 实测：把 `cachedChoiceFresh`
+   * 的 TTL 那行删掉，43 条**全绿**。本条把那条腿钉住。
+   *
+   * ## 判据形态（为什么这样写才有牙）
+   *
+   * 1. 用 `now` 注入时钟（夹具接口里 `now?: () => number` 此前**零调用者**）；
+   * 2. 先经 `prepareCall` 走**真实链路**把缓存写好（不直接改私有字段）；
+   * 3. 把时钟推过 TTL —— ⚠️ 此时**只动时钟、不动缓存**，`expiryOf` 仍永不 resolve：
+   *    缓存过期后 `resolveModel` **绝不能**重新选型（那会挂住 70 秒、本条超时），
+   *    它必须直接回落到降级元数据。这正是「TTL 那一行在 `cachedChoiceFresh` 里」
+   *    的承重证明 —— 删掉它，时钟推进也不再让缓存失效 ⇒ 返回真实元数据 ⇒ 本条红。
+   *
+   * ⚠️ 双指纹（`contextWindow` + `reasoning`）：「真实元数据」两个指纹都在，
+   *    降级那份两个都不在。
+   */
+  it('★★ 缓存过了 TTL 后必须回落降级元数据（否则 cachedChoiceFresh 的 TTL 腿无覆盖）', async () => {
+    let now = AUTO_NOW
+    const { adapter } = makeAutoAdapter({ now: () => now })
+    // 真实链路写缓存（`ensureChoice` 会把 `{ at: now, choice, info }` 写进去）。
+    await adapter.prepareCall(AUTO_PROVIDER, AUTO_MODEL)
+    // 前置：TTL 窗口内先确认「确实是真实元数据」，否则下面的回退断言会因别的原因绿。
+    const fresh = await adapter.resolveModel()
+    expect(fresh.context?.contextWindow, '前置：窗口内应是真实窗口').toBe(REAL_INFO_CONTEXT_WINDOW)
+    expect(
+      fresh.reasoning?.efforts?.map((effort) => String(effort.id)),
+      '前置：窗口内应带目标档位',
+    ).toEqual(['high', 'low'])
+
+    // 把时钟推过 TTL（多推 1ms 保证严格超过边界）。
+    now = AUTO_NOW + AUTO_CHOICE_TTL_MS + 1
+    const stale = await adapter.resolveModel()
+    // ⛔ 删掉 `cachedChoiceFresh` 的 TTL 那一行 ⇒ 仍返回缓存里的真实元数据 ⇒ 本条红。
+    expect(
+      stale.context?.contextWindow,
+      '★★ 缓存过期后必须回落保守窗口（TTL 腿的判别指纹）',
+    ).not.toBe(REAL_INFO_CONTEXT_WINDOW)
+    expect(stale.reasoning, '★★ 缓存过期后必须回落降级元数据（不带档位）').toBeUndefined()
+    // 身份与模态不受影响（降级路径照常声明，见第 2 条）。
+    expect(stale.provider).toBe(AUTO_PROVIDER)
+    expect(stale.id).toBe(AUTO_MODEL)
+    expect(stale.inputModalities).toEqual(expect.arrayContaining(['text', 'image']))
   })
 })

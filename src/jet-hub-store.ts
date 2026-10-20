@@ -948,7 +948,7 @@ class MemoryStore implements JetHubStore {
  * 依据 `src/product.ts` 与各 `*-product.ts` 的 `id` 字段：
  * `codearts` / `buddy` / `workbuddy` / `lobsterai` / `qoder` / `qodercn`
  * / `trae` / `cline` / `loomy` / `raccoon` / `minimax` / `minimaxintl`
- * / `zcode` / `opencode` / `gemini` / `officeace` / `accio`。
+ * / `zcode` / `opencode` / `gemini` / `officeace` / `accio` / `astudio`。
  * ⚠️ 这行清单必须与**下面那张表的实际项数**一致（2026-10-13 合并审计：
  *    此前它漏了 `officeace` —— 表里有、清单里没有，属注释失实）。
  */
@@ -1002,6 +1002,10 @@ const REF_PREFIX_TO_PROVIDER: ReadonlyArray<readonly [string, string]> = [
   //（凭据还在 `.credentials.yaml` 里，只是索引建不出来，用户只能重新登录）。
   ['ACCIO', 'accio'],
   ['AUTOCLAW', 'autoclaw'],
+  // ⚠️ 第 18 个 provider（astudio，2026-10-16）—— 同款坑第 **六** 次。
+  // 漏加 = `ASTUDIO_ACCOUNT_*` 的账号在 `state.json` 缺失时静默消失
+  //（凭据还在 `.credentials.yaml` 里，只是索引建不出来，用户只能重新导入）。
+  ['ASTUDIO', 'astudio'],
 ]
 
 /** 账号凭据 ref 形态：`{PREFIX}_ACCOUNT_{HEX}`（前缀由单一真相源派生）。 */

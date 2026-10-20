@@ -255,6 +255,12 @@ const OFFICEACE_ICON = 'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy
  * **不用 `btoa()`** —— 该 bundle 由 esbuild 打包，目标环境未必提供它。
  */
 const ACCIO_ICON = 'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHJlY3Qgd2lkdGg9IjI0IiBoZWlnaHQ9IjI0IiByeD0iNSIgZmlsbD0iI0ZGNkEwMCIvPjxwYXRoIGQ9Ik03LjQgMTcuMiAxMSA2LjhoMmwzLjYgMTAuNGgtMi4xbC0uNzItMi4yNEgxMC4ybC0uNzIgMi4yNEg3LjRaIiBmaWxsPSIjZmZmIi8+PHBhdGggZD0iTTEwLjc0IDEzLjI2aDIuNTJMMTIgOS41bC0xLjI2IDMuNzZaIiBmaWxsPSIjRkY2QTAwIi8+PC9zdmc+';
+/**
+ * AStudio（讯飞 AstronStudio）图标：本仓库无法获得官方 logo，故为**自绘最小 SVG**
+ * （品牌蓝底 + 白色字母 A），不代表官方美术资产。编码方式与 ACCIO_ICON 同款：
+ * base64 由纯 Node 预先算好写死（不用 btoa，esbuild 目标环境未必提供）。
+ */
+const ASTUDIO_ICON = 'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHJlY3Qgd2lkdGg9IjI0IiBoZWlnaHQ9IjI0IiByeD0iNSIgZmlsbD0iIzFGNkZFQiIvPjxwYXRoIGQ9Ik0xMiA2LjIgMTcuNiAxOC4yaC0yLjJsLTEuMi0yLjlIOS44bC0xLjIgMi45SDYuNHoiIGZpbGw9IiNGRkZGRkYiLz48cmVjdCB4PSI5LjIiIHk9IjEyLjYiIHdpZHRoPSI1LjYiIGhlaWdodD0iMS41IiBmaWxsPSIjRkZGRkZGIi8+PC9zdmc+';
 
 
 /**
@@ -287,7 +293,8 @@ export const PROVIDER_ICONS = {
   gemini: GEMINI_ICON,
   officeace: OFFICEACE_ICON,
   accio: ACCIO_ICON,
-autoclaw: AUTOCLAW_ICON,
+  astudio: ASTUDIO_ICON,
+  autoclaw: AUTOCLAW_ICON,
   modelscope: MODELSCOPE_ICON,
   aggregate: AGGREGATE_ICON,
 };

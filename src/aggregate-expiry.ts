@@ -818,28 +818,47 @@ async function sharedPackageExpiry(
   let balance
   try {
     balance = await fetchBalance()
-  } catch {
-    // ⚠️⚠️ **潜在脆弱点（2026-10-16 审计实测，当前生产不可达）**：
-    //    这个裸 `catch` 会把**中止（abort）**也折算成 `UNUSABLE`，违反本仓库
-    //    「abort 必须抛出、绝不成 `UNUSABLE`」的铁律；而本 PR 新增的
-    //    `fetchBalanceWithCache` 让**共享缓存那条腿**的中止第一次能走到这里
-    //   （`balance-cache.ts` 的 `isAbort` 会原样上抛）。
-    //
-    //    **为什么当前不可达**（审计逐级核实，我独立复核过每一环）：
-    //    buddy / workbuddy / lobsterai / trae 四家在 `provider-credits.ts`
-    //    只注册 `fetchBalance`（**不是** `fetchBalanceDetailed`），而它们的原语
-    //   （`fetchCreditBalance` / `fetchLobsteraiCreditBalance` / `fetchTraeCreditBalance`）
-    //    内部经 `postJson` / `requestJson`，那两个助手的 `catch` 把**一切**错误
-    //   （含 `AbortError` 与 `AbortSignal.timeout` 的 `TimeoutError`）压成
-    //    `{ ok: false, message }` ⇒ 这三份实现**从不向上抛中止**（裸 `throw` 零命中）。
-    //
-    //    ⇒ **不属本 PR 的验收阻断项**（该 catch 早于本 PR 存在）。但若将来
-    //    ①某家改用 `fetchBalanceDetailed`、或 ②`postJson` 改为抛出、或
-    //    ③新增走 `fetchBalanceWithCache` 的渠道 —— 这里会立刻把中止吃掉
-    //   （症状：用户取消后看到「没有任何可用候选」而不是中止）。
-    //    ⇒ **加固方式**：与本文件 `createExpiryProbe` 同口径，先判中止再兜底：
-    //      catch (error) { if (isAbortLike(error, signal)) throw error; return UNUSABLE }
-    //    ⚠️ 别在无实测的情况下改它 —— 需要先确认真有一条腿会抛中止。
+  } catch (error) {
+    /**
+     * ⚠️⚠️ **中止必须原样逃逸**（铁律；这是同型缺陷在本文件的**第五处**）。
+     *
+     * ## 为什么必须修（2026-10-19，用户报障）
+     *
+     * 初版是**裸 `catch`** ⇒ 把 `AbortError` 也折算成 `UNUSABLE`。
+     * 而 `UNUSABLE` 会被 `cacheAndReturn` **缓存 60 秒**（`EXPIRY_CACHE_TTL_MS`）
+     * ⇒ **取消一次 = 该渠道对路由消失 60 秒**。
+     *
+     * 用户可见症状（真实会话日志，`aggregate: 「space-bunny」当前没有任何可用候选`）：
+     * - `step/start 1792418663502` → `turn/end 1792418663505` ⇒ **3 毫秒、零网络**；
+     * - 报错前一步是一次 **604 秒的 subagent 调用**（长任务被取消/超时）；
+     * - 该虚拟模型**只有 buddy 一家候选**（无备胎）⇒ 候选一空就直接撞
+     *   `candidatesFor() === []`（`src/aggregate-adapter.ts:1315`）；
+     * - 60 秒后缓存过期 ⇒ 自愈 ⇒ 表现为「发消息继续就又能工作了」。
+     *
+     * ## 可达性：已实测，**如实标注**（别读成「生产已复现」）
+     *
+     * | 探针 | 结果 |
+     * |---|---|
+     * | `buddyExpiry` 的 `cached()` 抛 `AbortError` | **被吞成 `UNUSABLE`** ← 本修法修的接缝 |
+     * | `balanceCache.readOne` 上游抛中止 | **原样上抛**（`src/balance-cache.ts:402`）⇒ 接缝已开口 |
+     * | 真实 buddy 腿 `fetchCreditBalance` | `postJson` 把中止压成 `{ok:false}` ⇒ **该腿不抛中止** |
+     *
+     * ⇒ buddy 当前**不可达**；但共享缓存那条腿（上一行第二条）**已经会抛中止**，
+     *  且 `src/index.ts:3273` 正是把 `readOne` 接到本函数的 `cached()` 上
+     *  ⇒ 这是**接缝安全**，不是「已复现的故障」。旧注释预言的三种情形
+     *  （某家改用 `fetchBalanceDetailed` / `postJson` 改为抛出 / 新增走
+     *  `fetchBalanceWithCache` 的渠道）任一发生，这里就会立刻吃掉中止。
+     *
+     * ⚠️ **判据只认 `isAbortError`，不额外查 signal**：本函数**收不到 `signal`**
+     *   （签名只有 `fetchBalance`，见 `@param`）。入口 signal 已标记的那种情形
+     *   由 `createExpiryProbe` 的循环逐轮 `signal?.throwIfAborted()` 负责 ——
+     *   与该文件 `zcodeExpiry` 分支的登记口径一致。
+     *
+     * ⚠️ 其余错误**仍折算成 `UNUSABLE`**（不改既有裁决）：
+     *   `tests/unit/aggregate-expiry.spec.ts:802` 的「全部账号折算失败 ⇒ UNUSABLE」
+     *   是**有意取舍**（「不能把『不知道』当『可用』」），本次**刻意不动**它。
+     */
+    if (isAbortError(error)) throw error
     return UNUSABLE
   }
   if (balance === null) return UNUSABLE

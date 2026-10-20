@@ -27,17 +27,18 @@ describe('ProviderDescriptor：与既有产物的逐条一致性', () => {
     }
   })
 
-it('共 20 条（19 个真渠道 + aggregate）', () => {
+  it('共 21 条（20 个真渠道 + aggregate）', () => {
     // ⚠️ 2026-10-13 合并：officeace（第 15）与 accio（第 16）**同一次**并入，
     //    故从 15/14 直接跳到 17/16 —— 不是漏了一格。
     // ⚠️ 2026-10-15 加 minimaxintl（MiniMax Code 国际版，第 17 个真渠道）：
     //    它与 `minimax` 账号不互通、API 主机不同 ⇒ 是两个 provider。
-    // ⚠️ 2026-10-17 加 autoclaw（AutoClaw/智谱，第 18 个真渠道）。
-    // ⚠️ 2026-10-16 **本 fork** 并入 modelscope（魔搭，第 19 个真渠道）：上游没有它。
+    // ⚠️ 2026-10-16 并入 astudio（第 18 个真渠道）。
+    // ⚠️ 2026-10-17 加 autoclaw（AutoClaw/智谱，第 19 个真渠道）。
+    // ⚠️ 2026-10-16 **本 fork** 并入 modelscope（魔搭，第 20 个真渠道）：上游没有它。
     //    ⚠️ 合并上游时**不要**把这里改回上游数字 —— 那会让两个声明都失去守卫
     //    （条数断言是「注册表没被误删」的唯一防线）。
-    expect(PROVIDER_REGISTRY).toHaveLength(20)
-    expect(PROVIDER_REGISTRY.filter((d) => d.channel).length).toBe(19)
+    expect(PROVIDER_REGISTRY).toHaveLength(21)
+    expect(PROVIDER_REGISTRY.filter((d) => d.channel).length).toBe(20)
     expect(PROVIDER_REGISTRY.find((d) => d.id === 'aggregate')?.channel).toBe(false)
   })
 
@@ -83,7 +84,7 @@ it('共 20 条（19 个真渠道 + aggregate）', () => {
 })
 
 describe('从 registry 派生的能力表与既有断言逐条相等', () => {
-  it('CREDITS 派生结果与既有 6 条 toEqual 断言一致', () => {
+  it('CREDITS 派生结果与既有 7 条 toEqual 断言一致（astudio 2026-10-16 加入）', () => {
     const caps = creditCapabilitiesOf()
     expect(caps.codearts).toEqual({ balance: true, dailyCheckin: true })
     expect(caps.buddy).toEqual({ balance: true, dailyCheckin: true })
@@ -91,6 +92,9 @@ describe('从 registry 派生的能力表与既有断言逐条相等', () => {
     expect(caps.qoder).toEqual({ balance: true, dailyCheckin: true })
     expect(caps.qodercn).toEqual({ balance: true, dailyCheckin: true })
     expect(caps.loomy).toEqual({ balance: true, dailyCheckin: true, onboardingTasks: true })
+    // ⚠️ 2026-10-16 并入 astudio：逐家 toEqual，漏写这一条则「registry 加了
+    //    而客户端能力表没派生出来」这种漂移不会被本用例发现。
+    expect(caps.astudio).toEqual({ balance: true, dailyCheckin: true })
   })
 
   it('只有 cline 有 subscriptionQuota（既有断言 toEqual([\'cline\'])）', () => {
@@ -152,26 +156,37 @@ describe('从 registry 派生的能力表与既有断言逐条相等', () => {
     expect(win).toEqual(['autoclaw', 'buddy', 'lobsterai', 'officeace', 'trae', 'workbuddy'])
   })
 
-  it('rateLimit === false 恰好是 5 家（modelscope 2026-10-17 加入，理由与前四家不同）', () => {
+  it('rateLimit === false 恰好是 6 家（astudio 2026-10-18 加入；accio 2026-10-18 退出）', () => {
     const off = PROVIDER_REGISTRY.filter((d) => d.rateLimit === false)
       .map((d) => d.id).sort()
-    // ⚠️ **五种理由各不相同**（见 registry 里各自的字段注释）：
+    // ⚠️ **六家理由分两类**（见 registry 里各自的字段注释）：
     // - loomy：根本不返回限流错误（静默降级扣永久积分）；
     // - gemini / officeace：限流是服务端配额窗口制，本地标记与重测都不改变配额；
-    // - accio：**不写 `modelRateLimits` 且不在 `probeById` 里** ⇒
-    //   两个按钮恒为惰性（零请求、零清除）。
+    // - astudio（**本 fork**）：**不写 `modelRateLimits` 且不在 `probeById` 里**
+    //   （`astudio-adapter.ts` 同款）⇒ 两个按钮恒为惰性（零请求、零清除）。
+    // - autoclaw：**与 astudio 同族**（刻意不做请求级换号 + 冷却，不进 `probeById`）。
     // - modelscope（**本 fork**，2026-10-17 用户要求）：**能力齐全但刻意关入口** ——
     //   它确实会写 `modelRateLimits`、也确实注入了 `markLimited`。
-    //   ⚠️ 与前四家**不同源**：代价是「冷却标记仍写进池，但用户没法用按钮清除」
+    //   ⚠️ 与前几家**不同源**：代价是「冷却标记仍写进池，但用户没法用按钮清除」
     //   （只能等自然过期或删号重加），而不是「按钮点了没用」。
     //   ⚠️ 它在 `credits-capabilities.spec.ts` 的 `RATE_LIMIT_OFF_BY_CHOICE`
     //   里有独立登记（那张表专门区分「产品取舍」与「语义管辖不到」两类）。
     //
+    // ⚠️⚠️ **accio 曾在这张表里，2026-10-18 因 issue IKM3ZV 退出**（7 家 → 6 家）：
+    //   当时它的理由是「不写 `modelRateLimits` 且不在 `probeById` 里 ⇒ 按钮恒惰性」。
+    //   接上请求级换号 + 冷却（`accio-adapter.ts` 的 `markCurrentAccount`，
+    //   额度至 UTC+8 当日 24:00 / 限流 1h）后，① 真的写标记了、② `probeById`
+    //   也登记了 ⇒ 那个理由**已不成立**，`rateLimit: true` 是**实打实可用**的入口
+    //   （与 modelscope 的「能力齐全但刻意关」相反）。
+    //   ⚠️ **三处必须同改**（registry 本行 / `src/index.ts` 的 `probeById` /
+    //   `tests/helpers/provider-sets.ts` 的 `WRITES_RATE_LIMIT_PROVIDERS`），
+    //   由 `provider-runtime-wiring.spec.ts` 双向比对锁死 —— 本表是**第四道**闸。
+    //
     // 新增一家时**不要**只改这里：判据是 registry 的落地问法
-//「这个按钮点下去，能不能让用户少受限一次？」——
+    //「这个按钮点下去，能不能让用户少受限一次？」——
     // ⚠️ 而 modelscope 打破的正是这条问法的前提（它**能**，只是不要）。
     //    ⇒ 所以「能」不再是必要条件，「用户是否要这个按钮」才是。
-    expect(off).toEqual(['accio', 'autoclaw', 'gemini', 'loomy', 'modelscope', 'officeace'])
+    expect(off).toEqual(['astudio', 'autoclaw', 'gemini', 'loomy', 'modelscope', 'officeace'])
   })
 
   it('accountTest === true 恰好是 gemini', () => {
@@ -179,10 +194,16 @@ describe('从 registry 派生的能力表与既有断言逐条相等', () => {
     expect(t).toEqual(['gemini'])
   })
 
-  it('creditPackages 恰好是既有的 8 家（officeace 2026-10-12、autoclaw 2026-10-17 加入）', () => {
+  it('creditPackages 恰好是既有的 9 家（officeace 2026-10-12、autoclaw 2026-10-17、astudio 2026-10-20 加入）', () => {
+    // ⚠️ `creditPackages` 决定**账号名 hover 是否列资源包**。astudio 是 2026-10-20
+    //    用户报障补上的：它的 `buildAstudioBalance` **本来就**把四个池逐包解析出了
+    //    到期时间（`member`/`buy`/`activity`/`spark` 的 `*NextExpireTime`），
+    //    缺的只是这条声明 ⇒ hover 看不到「没过期的资源包」。
     const p = PROVIDER_REGISTRY.filter((d) => d.creditPackages === true)
       .map((d) => d.id).sort()
-    expect(p).toEqual(['autoclaw', 'buddy', 'lobsterai', 'officeace', 'qoder', 'qodercn', 'trae', 'workbuddy'])
+    expect(p).toEqual([
+      'astudio', 'autoclaw', 'buddy', 'lobsterai', 'officeace', 'qoder', 'qodercn', 'trae', 'workbuddy',
+    ])
   })
 
   it('autoCheckinExcluded 恰好是 zcode', () => {
@@ -194,8 +215,8 @@ describe('从 registry 派生的能力表与既有断言逐条相等', () => {
     const withNs = PROVIDER_REGISTRY.filter((d) => d.settingsNamespace !== undefined)
       .map((d) => d.id).sort()
     expect(withNs).toEqual([
-      'accio', 'autoclaw', 'buddy', 'cline', 'codearts', 'gemini', 'lobsterai', 'loomy', 'minimax',
-      'minimaxintl', 'officeace', 'qoder', 'qodercn', 'raccoon', 'trae', 'workbuddy', 'zcode',
+      'accio', 'astudio', 'autoclaw', 'buddy', 'cline', 'codearts', 'gemini', 'lobsterai', 'loomy',
+      'minimax', 'minimaxintl', 'officeace', 'qoder', 'qodercn', 'raccoon', 'trae', 'workbuddy', 'zcode',
     ])
   })
 })

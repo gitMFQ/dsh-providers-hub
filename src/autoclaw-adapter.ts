@@ -32,6 +32,7 @@ import {
   cleanBearerToken,
   normalizeAutoclawModel,
   autoclawMaxTokens,
+  autoclawEffortForRequest,
   parseAutoclawRemoteModels,
   prepareAutoclawMessages,
   buildAutoclawHeaders,
@@ -77,12 +78,21 @@ export interface AutoclawAdapterOptions {
   >
   /** 目录加载完成通知。 */
   onCatalogLoaded?: () => void
+  /**
+   * 告警出口（2026-10-18 审计 P0 新增，与 `astudio-adapter.ts` 同型）。
+   *
+   * ⚠️ 存在的理由是**丢弃思考档位必须留痕**：上游对非法档位回 200 并按最贵
+   * 那档跑，若静默丢弃，用户付了 `max` 的钱却在 UI 上看到「未思考」——
+   * 没有日志就等于把账算到模型头上。
+   */
+  warn?: (message: string) => void
   /** 产品配置。 */
   product?: AutoclawProduct
 }
 
 export class AutoclawAdapter extends LlmAdapter {
   private readonly product: AutoclawProduct
+  private readonly warnImpl: (message: string) => void
   private announced = false
   /**
    * 远端模型规格缓存（2026-10-17 审计 P1 修复）。
@@ -100,6 +110,7 @@ export class AutoclawAdapter extends LlmAdapter {
   constructor(private readonly options: AutoclawAdapterOptions = {}) {
     super()
     this.product = options.product ?? AUTOCLAW
+    this.warnImpl = options.warn ?? ((message: string) => { console.warn(message) })
   }
 
   private async resolveCredential(modelId?: string): Promise<AutoclawCredential | undefined> {
@@ -454,6 +465,21 @@ export class AutoclawAdapter extends LlmAdapter {
       this.product.fallbackModels.find((m) => m.id === upstreamModel)?.maxOutputTokens,
     )
 
+    // ⚠️⚠️ **档位本地校验**（2026-10-18 审计 P0）：上游对非法档位**回 200 并按
+    //   最贵那档跑**，静默透传等于让用户为 `max` 付钱却在 UI 上看到「未思考」。
+    //   ⇒ 丢弃时**必须留痕**，否则事后无从归因（与 max_tokens 夹取同一纪律）。
+    //   ⚠️ 声明集合取 `AUTOCLAW_DECLARED_EFFORTS` —— 与 `resolveModel` 同一份
+    //   常量，本家档位是**全渠道统一**的三档，不按模型分。
+    const effortDecision = autoclawEffortForRequest(
+      options.reasoningEffort === undefined ? undefined : String(options.reasoningEffort),
+      AUTOCLAW_DECLARED_EFFORTS,
+    )
+    if (effortDecision.dropped !== undefined) {
+      this.warnImpl(
+        `[autoclaw] 丢弃思考档位 ${effortDecision.dropped}：${effortDecision.reason ?? ''}`,
+      )
+    }
+
     // 转换 tools 为 OpenAI function calling 标准格式
     const tools = options.tools && options.tools.length > 0
       ? options.tools.map((tool) => ({
@@ -481,22 +507,19 @@ export class AutoclawAdapter extends LlmAdapter {
       //   ⚠️ 两者都取不到时**不发该字段**（网关默认），绝不编造数值。
       ...(wireMaxTokens === undefined ? {} : { max_tokens: wireMaxTokens }),
       ...(options.temperature !== undefined ? { temperature: options.temperature } : {}),
-      // ⚠️⚠️ **只发 `reasoning_effort`，不再双发 `thinking_level`**
-      //   （2026-10-17 审计修复，依据来自桌面端源码实测）。
-      //   原写法是两个字段名同值下发，且**零实测依据**；本仓库有先例：
-      //   raccoon 的 `reasoning_effort` 被接受但无效果、trae 三个名字都返 200
-      //   ⇒ 「返 200」不等于生效。
-      //   ⚠️ **实测依据**（`AutoClaw2\resources\app\dist\main.cjs`，2026-10-17）：
-      //   桌面端托管模型网关的请求体里只出现 `reasoning_effort`；
-      //   而 `thinking_level` 的全部 27 处命中**没有一个是上行请求体字段** ——
-      //   它们是 SQLite 的 `work_runs.thinking_level` **列**（含
-      //   `CHECK(thinking_level IN ('off','minimal','low','medium','high','xhigh','max'))`
-      //   的本地约束）与埋点字段（`thinking_level: analyticsCode(...)`），
-      //   属**本地会话状态**，不是协议字段。
-      //   ⇒ 保留双发的风险是：给一个上游不认识的字段赋值。**删掉它比留着安全**
-      //   （最坏情况是上游按 schema 校验拒绝整个请求）。
-      ...(options.reasoningEffort !== undefined ? {
-        reasoning_effort: String(options.reasoningEffort),
+      // ⚠️⚠️ **档位必须先过 `autoclawEffortForRequest` 本地校验**（2026-10-18 审计 P0）。
+      //   原实现是裸透传 `String(options.reasoningEffort)`，而上游对**非法档位
+      //   不报错**：`turbo` / `ultra` / `off` 实测全部回 HTTP 200 并跑完
+      //   （`docs/audit/pr111-autoclaw-audit.md` 的取证表）。⇒ 用户选到集合外的
+      //   值时**按最贵那档计费与延迟**，症状是「变慢 / 变贵」而非报错，
+      //   事后无从归因 ⇒ 必须在本地拦。
+      //   ⚠️ 只发 `reasoning_effort`，**不再双发 `thinking_level`**（2026-10-17 修复）：
+      //   桌面端 `AutoClaw2\resources\app\dist\main.cjs` 的托管网关请求体里只出现
+      //   `reasoning_effort`；而 `thinking_level` 的 27 处命中全属 SQLite 的
+      //   `work_runs.thinking_level` 列与埋点字段，是**本地会话状态**而非协议字段。
+      //   ⇒ 保留双发的风险是给上游不认识的字段赋值（最坏被 schema 校验拒整个请求）。
+      ...(effortDecision.effort !== undefined ? {
+        reasoning_effort: effortDecision.effort,
       } : {}),
       ...(options.stop !== undefined && options.stop.length > 0 ? { stop: options.stop } : {}),
     }
@@ -598,6 +621,9 @@ export function registerAutoclawLlm(
   const adapter = new AutoclawAdapter({
     ...options,
     onCatalogLoaded: () => broadcastCatalogChanged(ctx),
+    // ⚠️ 兜底 `console.warn` 而不是吞掉：丢弃档位属于「用户付了钱但没生效」，
+    //   日志是唯一的归因线索（同 `refreshTargets` 的可观测性纪律）。
+    warn: options.warn ?? ((message: string) => { ctx.logger.warn(message) }),
   })
   registerAdapterIdempotent(ctx.llm, [product.id], adapter)
   return adapter

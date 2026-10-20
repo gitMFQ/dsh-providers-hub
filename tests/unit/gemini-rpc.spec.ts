@@ -249,10 +249,12 @@ async function waitForGone(
   }, `占位账号被清理（${accountId}）`)
 }
 
-/** 剥掉注释：接线断言不该因为「注释里提到了某个符号」而通过。 */
-function stripComments(source: string): string {
-  return source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
-}
+/**
+ * ⚠️ 实现已迁到 `tests/helpers/strip-comments.ts`（两个 spec 共用一份 ——
+ * IKLZ2 对抗审计实测：不剥注释时，「把接线删掉、只留注释里的字面量」这类
+ * 变异能让判据全绿）。
+ */
+import { stripComments } from '../helpers/strip-comments.js'
 
 describe('Gemini Jet Hub 登录接入', () => {
   it('★ account.create 立刻返回真实 Google 授权 URL，并登记一个不可续期的占位账号', async () => {
@@ -536,7 +538,15 @@ describe('Gemini 接线点（源码断言）', () => {
     //    改为断言声明值；「index.ts 真的按它注册了」由
     //    `provider-registry-consumers.spec.ts` 的 `apply()` 行为用例守。
     expect(descriptorOf('gemini')?.settingsNamespace).toBe('llm-gemini')
-    expect(indexSource).toContain('new GeminiAuth(ctx)')
+    // ⚠️ 2026-10-18（Gitee IKLTZ2）：原先断言逐字串 `new GeminiAuth(ctx)`，
+    // 而修复把构造改成 `new GeminiAuth(ctx, { fetchFor: … })`（注入按账号的
+    // 代理感知 fetcher）⇒ 文本断言变红而行为变好了。
+    // ⇒ 改为断言**两件更强的事**：确实构造了 GeminiAuth，且**带了 fetcher**。
+    //    「带上了」才是这条断言真正要守的东西（漏掉它 = 全链路恒直连，
+    //    症状与 issue 原话逐字同形）。
+    expect(indexSource).toMatch(/new GeminiAuth\(ctx,\s*\{\s*fetchFor:/)
+    expect(indexSource, 'index.ts 必须把账号代理解析器注入探测适配器')
+      .toMatch(/fetchFor:\s*geminiFetchForAccount/)
     expect(indexSource).toContain('registerGeminiLlm(ctx, {')
     // ⚠️ 漏了这一条 ⇒ 续期定时器**永不武装**（不是「刷得慢」，是压根不刷）。
     // ⚠️ **2026-10-08 改（Task 10）**：原先断言 `src/index.ts` 的源码文本含手抄清单

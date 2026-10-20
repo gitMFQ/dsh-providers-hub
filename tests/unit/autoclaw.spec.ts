@@ -16,7 +16,11 @@ import {
   parseAutoclawCredential,
   isAutoclawRefreshable,
   isAutoclawTokenExpired,
+  autoclawExpiresAtMs,
+  autoclawJwtExpiresAtMs,
+  autoclawAccessTokenExpiresAtMs,
   autoclawDisplayNickname,
+  autoclawEffortForRequest,
   type AutoclawCredential,
   type ChatMessage,
 } from '../../src/autoclaw.js'
@@ -27,10 +31,28 @@ import type { GenerateOptions } from '@deepseek-ai/dsh-llm'
 import {
   sendAutoclawVerificationCode,
   loginAutoclawWithCode,
+  refreshAutoclawToken,
   probeAutoclawLocalCredential,
   AUTOCLAW_SEND_CODE_PATH,
   AUTOCLAW_LOGIN_PATH,
 } from '../../src/autoclaw-oauth.js'
+import { shouldRefreshNow } from '../../src/expiry-sync.js'
+
+/** 一天（毫秒）——本文件多处用它构造「编造的 7 天」与 JWT 的真实 24h。 */
+const ONE_DAY_MS = 86_400_000
+
+/**
+ * 造一个**可解 payload** 的 JWT。
+ *
+ * ⚠️ 签名段是占位串：本仓库读 `exp` 的判据**不验签**（网关自己也只按 `exp` 判），
+ *   这是刻意的 —— 用例要锁的是「过期时间从哪读」，不是密码学。
+ * ⚠️ 必须用 `base64url`（`-` / `_`），与真实 JWT 一致：用标准 base64 造不出
+ *   `+` / `/` 的样本，会漏掉解码归一那一格。
+ */
+function makeJwt(payload: Record<string, unknown>): string {
+  const seg = (value: unknown): string => Buffer.from(JSON.stringify(value)).toString('base64url')
+  return `${seg({ alg: 'HS256', typ: 'JWT' })}.${seg(payload)}.sig`
+}
 
 describe('AutoClaw 纯函数与核心协议', () => {
   describe('calculateAutoclawSign - MD5 签名计算', () => {
@@ -286,6 +308,86 @@ describe('AutoClaw 纯函数与核心协议', () => {
       expect(autoclawDisplayNickname({ access_token: 'a', refresh_token: 'r', user_name: '张三' })).toBe('张三')
       expect(autoclawDisplayNickname({ access_token: 'a', refresh_token: 'r', user_id: 878541 })).toBe('用户878541')
       expect(autoclawDisplayNickname(undefined, 'fallback_id')).toBe('fallback_id')
+    })
+
+    // ═════════════════════════════════════════════════════════════════════
+    // ★★ 2026-10-19 P0 回归锁：access_token 的真实死线**只能**来自 JWT 的 `exp`
+    //
+    // 事故：登录响应不带 `expires_at` / `expires_in` 时，旧实现编造
+    // `Date.now() + 7 * 86400_000`；而真实寿命是 24h（JWT `iat`→`exp` 恒 86400s）
+    // ⇒ `refreshAll` 的 lead-time 判据与积分按需自愈**双双跳过**，
+    // 过期后表现为「刚启动还能看到积分、过一会儿变成登录凭据失效」，日志零字。
+    // ═════════════════════════════════════════════════════════════════════
+    describe('★★ access_token 死线以 JWT 为准（不得编造）', () => {
+      it('autoclawJwtExpiresAtMs：合法 JWT 取 exp×1000；读不出来的四格一律 undefined', () => {
+        const expSec = Math.floor(Date.now() / 1000) + 3600
+        expect(autoclawJwtExpiresAtMs(makeJwt({ exp: expSec }))).toBe(expSec * 1000)
+        // ⚠️ 下面四格是**回退信号**，必须全部返回 undefined：任一格返回数字
+        //   都会让「读不到 ⇒ 用声明值 / undefined」这条兜底路失效。
+        expect(autoclawJwtExpiresAtMs('at_secret_token_123'), '非 JWT（无点号）').toBeUndefined()
+        expect(autoclawJwtExpiresAtMs('a.b'), '段数不足（2 段）').toBeUndefined()
+        expect(autoclawJwtExpiresAtMs('a.b.c.d'), '段数过多（4 段）').toBeUndefined()
+        expect(autoclawJwtExpiresAtMs('a.!!!not-base64!!!.c'), 'payload 解不出 JSON').toBeUndefined()
+        expect(autoclawJwtExpiresAtMs(makeJwt({ exp: '1793000000' })), 'exp 是字符串').toBeUndefined()
+        expect(autoclawJwtExpiresAtMs(makeJwt({})), 'payload 无 exp').toBeUndefined()
+        expect(autoclawJwtExpiresAtMs(undefined)).toBeUndefined()
+      })
+
+      it('autoclawJwtExpiresAtMs：容忍 Bearer 前缀（与 cleanBearerToken 同口径）', () => {
+        const expSec = Math.floor(Date.now() / 1000) + 3600
+        expect(autoclawJwtExpiresAtMs(`Bearer ${makeJwt({ exp: expSec })}`)).toBe(expSec * 1000)
+      })
+
+      it('⚠️ autoclawAccessTokenExpiresAtMs：JWT 优先，读不到才用声明值（undefined 是合法结果）', () => {
+        const expSec = Math.floor(Date.now() / 1000) + 3600
+        expect(autoclawAccessTokenExpiresAtMs(makeJwt({ exp: expSec }), 9_999_999_999_999))
+          .toBe(expSec * 1000)
+        expect(autoclawAccessTokenExpiresAtMs('opaque-token', 9_999_999_999_999)).toBe(9_999_999_999_999)
+        expect(autoclawAccessTokenExpiresAtMs('opaque-token', undefined)).toBeUndefined()
+      })
+
+      it('★★ parseAutoclawCredential：存量凭据里那个「编造的 7 天」必须被 JWT 覆盖', () => {
+        const expSec = Math.floor(Date.now() / 1000) + 3600
+        const jwt = makeJwt({ exp: expSec })
+        const cred = parseAutoclawCredential({
+          access_token: jwt,
+          refresh_token: 'rt',
+          // ← 旧实现写进用户目录的正是这种值（登录时刻 + 7 天）
+          expires_at: Date.now() + 7 * ONE_DAY_MS,
+        })
+        expect(cred, '凭据必须能解析').toBeDefined()
+        expect(cred!.expires_at).toBe(expSec * 1000)
+        // ⚠️ 显式排除 7 天量级：只断言「是个正数」对原缺陷零判别力。
+        expect(cred!.expires_at! - Date.now()).toBeLessThan(2 * ONE_DAY_MS)
+      })
+
+      it('★ 已过期的 JWT 凭据必须被判「该续期」（原缺陷下恒判「还有 6 天」）', () => {
+        // 这才是根因的行为锁：判据读的是 parse 之后的 expires_at。
+        const cred = parseAutoclawCredential({
+          access_token: makeJwt({ exp: Math.floor(Date.now() / 1000) - 60 }),
+          refresh_token: 'rt',
+          expires_at: Date.now() + 6 * ONE_DAY_MS,
+        })
+        expect(shouldRefreshNow(cred!.expires_at), '已过期的真死线必须放行续期').toBe(true)
+        // 反向对照：那份假值本身判「不需要刷」——正是事故里「静默跳过」的形态。
+        // （它恒为 false，故不构成独立判据，只把「这条用例为什么有牙」写进断言。）
+        expect(shouldRefreshNow(Date.now() + 6 * ONE_DAY_MS)).toBe(false)
+      })
+
+      it('非 JWT 时仍回退上游声明值；两者都没有时**不得编造**', () => {
+        expect(parseAutoclawCredential({ access_token: 'at', expires_at: 1_800_000_000_000 })?.expires_at)
+          .toBe(1_800_000_000_000)
+        // ⚠️ 旧实现是在 login 路径编造 7 天；这条锁住「解析层也不许有兜底数字」。
+        expect(parseAutoclawCredential({ access_token: 'at' })?.expires_at).toBeUndefined()
+      })
+
+      it('autoclawExpiresAtMs：秒 / 毫秒 / 相对秒数三格归一（JWT exp 是秒，故必须成立）', () => {
+        const now = 1_792_000_000_000
+        expect(autoclawExpiresAtMs(1_792_944_000, now)).toBe(1_792_944_000_000)
+        expect(autoclawExpiresAtMs(1_792_944_000_000, now)).toBe(1_792_944_000_000)
+        expect(autoclawExpiresAtMs(86_400, now)).toBe(now + 86_400_000)
+        expect(autoclawExpiresAtMs(undefined, now)).toBeUndefined()
+      })
     })
   })
 })
@@ -1090,6 +1192,84 @@ describe('AutoclawAdapter 流式映射与端到端模拟', () => {
     })
   })
 
+  describe('★★ 思考档位本地拦截（2026-10-18 审计 P0）', () => {
+    // ⚠️ 这组断言的是**行为**（真正发出去什么），不是源码文本 ——
+    //   「源码里出现过某个调用」会被 `if (false)` 短路写法骗过（AGENTS.md 记载）。
+    async function effortFor(requested: string | undefined) {
+      const calls: Array<{ init?: RequestInit }> = []
+      const warns: string[] = []
+      const fetcher = vi.fn(async (_url: unknown, init?: RequestInit) => {
+        calls.push({ init })
+        return new Response('data: [DONE]\n\n', {
+          status: 200, headers: { 'Content-Type': 'text/event-stream' },
+        })
+      }) as unknown as typeof fetch
+      const adapter = new AutoclawAdapter({
+        resolveCredential: async () => ({
+          access_token: 'at', refresh_token: 'rt', expires_at: 4102444800000,
+        }),
+        fetchImpl: fetcher,
+        product: AUTOCLAW,
+        warn: (m) => { warns.push(m) },
+      })
+      for await (const _c of adapter.stream({
+        provider: 'autoclaw', model: 'zai_auto',
+        messages: [createUserMessage({
+          content: [{ type: 'text', text: 'hi' }], source: { kind: 'user' },
+        })],
+        ...(requested === undefined ? {} : { reasoningEffort: requested as never }),
+      } as GenerateOptions)) { /* no-op */ }
+      const body = JSON.parse(String(calls[0]!.init?.body))
+      return { sent: body.reasoning_effort as string | undefined, warns }
+    }
+
+    it('集合内的档位原样发（low/high/max 三档都要走通）', async () => {
+      for (const effort of ['low', 'high', 'max']) {
+        const { sent } = await effortFor(effort)
+        expect(sent, `${effort} 应当原样上行`).toBe(effort)
+      }
+    })
+
+    it('★★ 集合外的档位**不发该字段**（上游回 200 并按最贵档跑，不拦就是烧钱）', async () => {
+      // ⚠️ 实测依据：`turbo` / `ultra` / `off` 三个非法值上游**全部回 200**
+      //   并正常跑完（`docs/audit/pr111-autoclaw-audit.md` 的取证表）⇒
+      //   症状是「变慢 / 变贵」而非报错，事后无从归因。
+      for (const bogus of ['turbo', 'ultra', 'off', 'medium', 'none', ' ']) {
+        const { sent } = await effortFor(bogus)
+        expect(sent, `非法档位 ${JSON.stringify(bogus)} 绝不能上行`).toBeUndefined()
+      }
+    })
+
+    it('⚠️ 丢弃必须**留痕**（否则用户付了 max 的钱却无从归因）', async () => {
+      const { warns } = await effortFor('turbo')
+      expect(warns.some((w) => w.includes('turbo')),
+        '丢弃档位时必须有告警，且要指名丢的是什么').toBe(true)
+    })
+
+    it('合法档位不得产生任何丢弃告警（防「无脑 warn」把日志刷满）', async () => {
+      const { warns } = await effortFor('high')
+      expect(warns).toEqual([])
+    })
+
+    it('⚠️ 用户未指定档位时不发该字段（走网关默认）', async () => {
+      const { sent, warns } = await effortFor(undefined)
+      expect(sent).toBeUndefined()
+      expect(warns).toEqual([])
+    })
+
+    it('判据本身：集合外的值必须回报 dropped + 可读的丢弃原因', () => {
+      const d = autoclawEffortForRequest('turbo', ['low', 'high', 'max'])
+      expect(d.effort).toBeUndefined()
+      expect(d.dropped).toBe('turbo')
+      expect(d.reason).toContain('low/high/max')
+
+      // ⚠️ 「未声明任何档位」也必须拦 —— 不能因为集合为空就当全都合法。
+      const none = autoclawEffortForRequest('high', [])
+      expect(none.effort).toBeUndefined()
+      expect(none.dropped).toBe('high')
+    })
+  })
+
   describe('AutoClaw 短信验证码快速登录与凭据兑换', () => {
     it('sendAutoclawVerificationCode 校验非法手机号并拒绝发送', async () => {
       const res1 = await sendAutoclawVerificationCode('12345')
@@ -1209,6 +1389,87 @@ describe('AutoclawAdapter 流式映射与端到端模拟', () => {
       expect(cred.user_phone).toBe('13800138000')
       expect(cred.device_id).toBe('test_dev_002')
       expect(cred.expires_at).toBeGreaterThan(Date.now())
+      // ⚠️ 加强（2026-10-19）：这条 token **不是** JWT ⇒ 必须走**声明值兜底**
+      //   （`expires_in: 86400` = 24h 量级），且旧的 7 天编造绝不能出现。
+      //   只断言「> now」对 7 天编造是零判别力的恒真残留。
+      expect(cred.expires_at! - Date.now()).toBeGreaterThan(ONE_DAY_MS - 60_000)
+      expect(cred.expires_at! - Date.now()).toBeLessThanOrEqual(ONE_DAY_MS)
+    })
+
+    it('⚠️⚠️ 上游不给 expires 字段时，死线必须来自 JWT exp（不得编造 7 天）', async () => {
+      // 这是 2026-10-19 真实报障的**第一现场**：登录响应里既没有
+      // `expires_at` 也没有 `expires_in`，旧实现写 `Date.now() + 7 * 86400_000`。
+      const expSec = Math.floor(Date.now() / 1000) + 86_400
+      const jwt = makeJwt({ exp: expSec, jti: '13800138000' })
+      const mockFetch = vi.fn().mockImplementation(() =>
+        Promise.resolve(new Response(JSON.stringify({
+          code: 0,
+          msg: 'SUCCESS',
+          data: { user_id: 'u1', access_token: jwt, refresh_token: 'rt_secret' },
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })),
+      )
+
+      const res = await loginAutoclawWithCode('13800138000', '654321', {
+        fetchImpl: mockFetch as any,
+        deviceId: 'test_dev_jwt',
+      })
+
+      expect(res.ok).toBe(true)
+      expect(res.credential?.expires_at).toBe(expSec * 1000)
+      // ⚠️ 显式排除旧兜底：差值必须是 24h 量级，不是 7 天。
+      expect(res.credential!.expires_at! - Date.now()).toBeLessThan(2 * ONE_DAY_MS)
+    })
+
+    it('⚠️⚠️ 上游声明 7 天（expires_in=604800）与 JWT 的 24h 冲突时，以 JWT 为准', async () => {
+      // ⚠️ 这一格是刻意的：**两种上游形状在当前实现下产出同一个数字**（都是 +7 天），
+      //   无法从算式区分，所以必须直接钉住「谁说了算」。若哪天有人把 JWT 腿删掉，
+      //   这条会立刻变红（而「上游不给字段」那条反而可能仍然绿）。
+      const expSec = Math.floor(Date.now() / 1000) + 86_400
+      const jwt = makeJwt({ exp: expSec })
+      const mockFetch = vi.fn().mockImplementation(() =>
+        Promise.resolve(new Response(JSON.stringify({
+          code: 0,
+          msg: 'SUCCESS',
+          data: { user_id: 'u1', access_token: jwt, refresh_token: 'rt', expires_in: 604_800 },
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })),
+      )
+
+      const res = await loginAutoclawWithCode('13800138000', '654321', { fetchImpl: mockFetch as any })
+      expect(res.ok).toBe(true)
+      expect(res.credential?.expires_at).toBe(expSec * 1000)
+      expect(res.credential!.expires_at! - Date.now()).toBeLessThan(2 * ONE_DAY_MS)
+    })
+
+    it('⚠️ 上游不给任何过期信息且 token 非 JWT 时，expires_at 必须是 undefined', async () => {
+      // 「不知道」必须如实表达：`shouldRefreshNow(undefined) === true` 会让它
+      // 每轮被续期（多刷一次），好过编一个偏大的数字把整条链静默焊死。
+      const mockFetch = vi.fn().mockImplementation(() =>
+        Promise.resolve(new Response(JSON.stringify({
+          code: 0,
+          msg: 'SUCCESS',
+          data: { user_id: 'u1', access_token: 'opaque_at', refresh_token: 'rt' },
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })),
+      )
+
+      const res = await loginAutoclawWithCode('13800138000', '654321', { fetchImpl: mockFetch as any })
+      expect(res.ok).toBe(true)
+      expect(res.credential?.expires_at).toBeUndefined()
+      expect(shouldRefreshNow(res.credential?.expires_at), '读不到死线时必须放行续期').toBe(true)
+    })
+
+    it('⚠️⚠️ 续期响应不带 expires 字段时同样以 JWT exp 为准（否则池内旧值不会纠正）', async () => {
+      const expSec = Math.floor(Date.now() / 1000) + 86_400
+      const jwt = makeJwt({ exp: expSec })
+      const mockFetch = vi.fn().mockImplementation(() =>
+        Promise.resolve(new Response(JSON.stringify({
+          code: 0,
+          data: { access_token: jwt, refresh_token: 'rt_new', user_id: 'u1' },
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })),
+      )
+
+      const cred = await refreshAutoclawToken('rt_old', { fetchImpl: mockFetch as any })
+      expect(cred.expires_at).toBe(expSec * 1000)
+      expect(cred.refresh_token).toBe('rt_new')
     })
 
     it('loginAutoclawWithCode 验证码错误时返回错误信息', async () => {

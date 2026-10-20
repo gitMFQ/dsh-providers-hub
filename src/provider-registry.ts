@@ -429,29 +429,54 @@ export const PROVIDER_REGISTRY: readonly ProviderDescriptor[] = Object.freeze([
     //    ⇒ **该入口尚未实现**，客户端只做诚实展示（三类积分桶 + 重置倒计时 +
     //    「删除该账号后重新登录」这条手动路径），不渲染任何点不动的控件。
     credits: { balance: true, dailyCheckin: false },
-    // ⚠️ `rateLimit: false` —— 这里的判据是 registry 自己的落地问法：
-    //    「这个按钮点下去，能不能让用户**少**受限一次？」答否即 false。
-    //    accio 两条都不满足：
-    //    ① 适配器**不写** `modelRateLimits`（`provider-runtime-wiring.spec.ts`
-    //       的 `WRITE_SITE_FILES` 把它登记为空，并由一条用例**验证**它确实无写点）
-    //       ⇒ 账号永远没有标记可清；
-    //    ② `src/index.ts` 的 `probeById` 没有它的条目（该表被守卫锁成**恰好**
-    //       「会写标记的家」）⇒ 点「重测」时 `retestAccount` 走到
-    //       `modelIds.length === 0` 处**提前返回**：零请求、零清除。
-    //    两者叠加 ⇒ 面板级的「重测所有 / 重置所有」与卡片级的两个按钮**全部恒为
-    //    惰性**。那正是本仓库记录过的报障形态（「按钮响应这么快，是不是坏了」）。
-    //    ⚠️ 与 loomy / gemini **理由不同**（它们是真会限流、只是按钮管辖不到）：
-    //    accio 是**根本没有这组按钮的作用对象**。
-    //    ⚠️ 「省略 = true 以免老用户失去按钮」那条理由**不适用于全新 provider**：
-    //    accio 没有存量用户，没有「功能回退」可言。
-    //    ⇒ 将来接上请求级换号 + 冷却（届时必须同时进 `probeById` 与
-    //    `WRITES_RATE_LIMIT_PROVIDERS`）时，**本行要一起改回 true**。
-    rateLimit: false,
+    // ⚠️⚠️ **`rateLimit` 已于 2026-10-18 由 `false` 改回 `true`**（issue IKM3ZV 修复）。
+    //    判据是 registry 自己的落地问法：「这个按钮点下去，能不能让用户**少**受限
+    //    一次？」—— 而**当时**答否，两条都不满足：
+    //    ① 适配器不写 `modelRateLimits` ⇒ 账号永远没有标记可清；
+    //    ② `src/index.ts` 的 `probeById` 没有它的条目 ⇒ 「重测」零请求、零清除。
+    //    接上请求级换号 + 冷却（`accio-adapter.ts` 的 `markCurrentAccount`，
+    //    额度至 UTC+8 当日 24:00 / 限流 1h）后 ① 已不成立，② 同步登记 ⇒ 本行翻转。
+    //
+    // ⚠️⚠️ **这三处必须同改**（本陷阱在本仓库已复发过多次）：
+    //    本行 + `src/index.ts` 的 `probeById` + `tests/helpers/provider-sets.ts`
+    //    的 `WRITES_RATE_LIMIT_PROVIDERS`。漏任一处 ⇒ 标记写进去却永远清不掉
+    //    （用户点「重测」报「没有探测适配器」）。三者由 `provider-runtime-wiring.spec.ts`
+    //    的 probe 域守卫**双向**比对锁死（漏一家 / 多一家都点名变红）。
+    //
+    // ⚠️ 与 loomy / gemini / officeace 各自的 `rateLimit: false` **理由不同**：
+    //    那三家是「真会限流、但按钮管辖不到 / 根本没有作用对象」；accio 现在是
+    //    「真的会写标记，且探测适配器已登记」⇒ 是**实打实可用**的入口。
+    rateLimit: true,
     settingsNamespace: 'llm-accio',
     channel: true,
   },
   {
-id: 'autoclaw',
+    id: 'astudio',
+    label: 'AStudio (讯飞)',
+    displayName: 'AStudio',
+    logoClass: 'astudio',
+    // AStudio 每日奖励签到对接 client-popups/pending（DAILY_REWARD_DIALOG）与
+    // client-popups/complete 领取流程 ⇒ dailyCheckin 启用为 true。
+    credits: { balance: true, dailyCheckin: true },
+    // ⚠️ rateLimit: false —— 判据同 accio（registry 落地问法「点下去能不能让用户少受限一次？」）：
+    //    astudio-adapter 不写 modelRateLimits，且刻意不进 src/index.ts 的 probeById
+    //    （probeById 被守卫锁成「恰好是会写标记的家」）⇒ 两个按钮恒为惰性。
+    //    将来接上请求级换号+冷却时必须同时改回 true 并进 probeById + WRITES_RATE_LIMIT_PROVIDERS。
+    rateLimit: false,
+    // ⚠️ **`creditPackages: true`**（2026-10-20 用户报障补）：本字段决定**账号名 hover
+    //    是否列出资源包**（`plugin-src/client/credits-capabilities.js` 的
+    //    `supportsCreditPackageList` 直接读它）。缺它 ⇒ 积分行只显示
+    //    「1/4 个资源包有效」而 **hover 看不到每个包与到期时间**，与其它 provider 不一致
+    //    （用户报障原文：「hover 应该能看到没过期的资源包」）。
+    //    依据：`buildAstudioBalance`（`astudio-credits.ts`）**已经**把四个池逐包解析出了
+    //    到期时间（`member` / `buy` / `activity` / `spark` 各自的 `*NextExpireTime`）
+    //    ⇒ 数据本来就齐，此前只是没声明。
+    creditPackages: true,
+    settingsNamespace: 'llm-astudio',
+    channel: true,
+  },
+  {
+    id: 'autoclaw',
     label: 'AutoClaw (智谱)',
     displayName: 'AutoClaw (智谱)',
     logoClass: 'autoclaw',

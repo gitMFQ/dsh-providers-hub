@@ -74,7 +74,10 @@ export const REFRESH_PROVIDERS = [
   // ⚠️ 它与 `minimax` 是**两个 provider**（账号不互通、凭据 ref 前缀不同），
   // 故**必须各占一项** —— 漏了它，国际站账号的 `account.refresh` 行为覆盖为零。
   'minimaxintl',
-// autoclaw（2026-10-17）：AutoClaw（智谱）有真实 refresh 端点
+  // astudio（2026-10-16，goal 302 接线）：有真实续期通路（src/astudio-auth.ts 的
+  // refreshOnce / refreshAccountCredential）—— 上游 401 时重取权威凭据并回写磁盘会话。
+  'astudio',
+  // autoclaw（2026-10-17）：AutoClaw（智谱）有真实 refresh 端点
   // （`autoclaw-auth.ts` 的 `refreshCredential` → `refreshAutoclawToken`），
   // 且 `refreshAccountCredential` 续期并回写池内 `expiresAt`
   // ⇒ 不属 loomy / zcode 那类「设计上没有 refresh 端点」的豁免。

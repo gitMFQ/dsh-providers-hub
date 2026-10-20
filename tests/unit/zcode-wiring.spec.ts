@@ -409,11 +409,12 @@ describe('ZCode 客户端接入（缺口 3 / 4 / 5）', () => {
     // 2026-10-01 加 opencode：12 → 13；2026-10-03 加 gemini：13 → 14；
     // 2026-10-07 加 aggregate：14 → 15；2026-10-12 加 officeace：15 → 16；
     // 2026-10-13 加 accio：16 → 17；2026-10-15 加 minimaxintl：17 → 18；
-    // 2026-10-17 加 autoclaw：18 → 19；
-    // 2026-10-16 **本 fork** 加 modelscope（魔搭）：19 → 20）。
+    // 2026-10-16 加 astudio：18 → 19；
+    // 2026-10-17 加 autoclaw：19 → 20；
+    // 2026-10-16 **本 fork** 加 modelscope（魔搭）：20 → 21）。
     // ⚠️ 这个断言的价值是「**别把既有 provider 挤掉**」，所以它同时断言
     // 上面的具体 id；若将来再加 provider，记得同步这里。
-    expect(ids).toHaveLength(20)
+    expect(ids).toHaveLength(21)
   })
 
   it('展示名与产品配置一致（避免两处漂移）', () => {
@@ -650,13 +651,14 @@ describe('ZCode RPC 分派（缺口 2：接线）', () => {
     const clientIds = clientProviderIds()
     // ⚠️ 2026-10-12 加 officeace、2026-10-13 加 accio：15 → 17。
     // ⚠️ 2026-10-15 加 minimaxintl（MiniMax Code 国际版）：17 → 18。
-// ⚠️ 2026-10-17 加 autoclaw（AutoClaw/智谱）：18 → 19；
-    //    同日 **本 fork** 加 modelscope（魔搭）：19 → 20。
+    // ⚠️ 2026-10-16 加 astudio（goal 302 接线）：18 → 19。
+    // ⚠️ 2026-10-17 加 autoclaw（AutoClaw/智谱）：19 → 20；
+    //    同日 **本 fork** 加 modelscope（魔搭）：20 → 21。
     //    ⚠️ clientProviderIds() 是**客户端图标表**的 id 数，与 registry 口径不同 ——
     //    权威值以断言实测为准，注释里的加减号只是**历史沿革**，不要拿来推当前数字。
-    expect(clientIds.length).toBe(20)
-    // ⚠️ 18 个 auth 键（20 个客户端 id − opencode − aggregate）。
-    expect(keys).toHaveLength(18)
+    expect(clientIds.length).toBe(21)
+    // ⚠️ 19 个 auth 键（21 个客户端 id − opencode − aggregate）。
+    expect(keys).toHaveLength(19)
     const withoutKey = clientIds.filter((id) => !keys.includes(id))
     expect([...withoutKey].sort()).toEqual(['aggregate', 'opencode'])
   })

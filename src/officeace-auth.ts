@@ -42,6 +42,7 @@ import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import { OFFICEACE } from './officeace-product.js'
 import { SerialQueue } from './serial-queue.js'
 import { shouldRefreshNow } from './expiry-sync.js'
+import { markLoginNeedsExternalAction } from './login-failure.js'
 // ⚠️ 只取类型（`import type`）：`account-pool.ts` 不 import 本模块，此处
 //    也不引入运行时依赖，故不构成循环导入。
 import type { ProviderAccountEntry } from './types.js'
@@ -503,10 +504,14 @@ async function fetchModelInfo(credential: OfficeAceCredential): Promise<void> {
   if (typeof auth?.model_app_key !== 'string' || typeof auth?.model_app_secret !== 'string') {
     // ⚠️ 判据：**半截凭据**（只有 key 没有 secret）也算「未开通」——不许写半截凭据进号池。
     // ⚠️ 文案里的出路信息是**被测行为**，别删（守卫会红）。
-    throw new Error(
+    // ⚠️ **必须打标记**（2026-10-20 用户报障）：这条失败的出路在**果办客户端**
+    //    （用该账号点「开通」并同意授权），重新点「+ 新建账号」只会重走一遍 OAuth
+    //    然后再失败一次 ⇒ 登录收尾处**不得**给它拼「请重新点击「+ 新建账号」」
+    //    那句**假出路**（判据与守卫见 `src/login-failure.ts`）。
+    throw markLoginNeedsExternalAction(new Error(
       '华为云未返回 MaaS 凭据：该账号尚未开通 ModelArts MaaS。'
       + '请先用该账号在果办客户端里点「开通」并同意授权，再回来重试。',
-    )
+    ))
   }
   credential.modelAppKey = auth.model_app_key
   credential.modelAppSecret = auth.model_app_secret

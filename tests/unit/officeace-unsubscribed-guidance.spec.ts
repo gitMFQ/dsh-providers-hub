@@ -26,6 +26,7 @@
 
 import { webcrypto } from 'node:crypto'
 import { readFileSync } from 'node:fs'
+import { loginNeedsExternalAction } from '../../src/login-failure.js'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -133,6 +134,16 @@ describe('未开通账号：抛错文案**必须给出路**', () => {
     // ⚠️ 出路两要素：**去哪**（果办客户端）+ **做什么**（点开通/同意授权）
     expect(message, '文案必须指路「果办客户端」——否则用户只能像 2026-10-16 那样自己摸索').toContain('果办客户端')
     expect(message, '文案必须说清动作是「开通」').toContain('开通')
+    // ⚠️⚠️ **必须带「出路在外部」标记**（2026-10-20 用户报障）：否则登录收尾处会给它
+    //    拼上「请重新点击「+ 新建账号」」—— 那句是**假出路**：开通与授权只能在**果办**
+    //    里做，重新点新建账号只会重走一遍 OAuth 然后再失败一次，还把上面那两句
+    //    唯一有用的指路冲淡了。
+    //    ⚠️ 「文案分支」本身的守卫在 `login-poll-terminal-failure.spec.ts`
+    //    （「带标记不得加通用后缀 / 未标记必须加」两条，那里有完整 RPC 夹具）。
+    expect(
+      loginNeedsExternalAction(error),
+      '未开通错误必须被标记为「重试无用、出路在外部」',
+    ).toBe(true)
     // ⚠️ 且**只允许**这两个请求（不许偷偷读客户端落盘 / 调本地 API）
     expect(seen.map((r) => r.url)).toEqual([TOKEN_URL, PERMISSION_URL])
   })

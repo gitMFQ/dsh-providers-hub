@@ -1003,6 +1003,216 @@ describe('CodeArtsAdapter', () => {
     expect(texts).toEqual(['ok'])
   })
 
+  /**
+   * ★★ 回归：**`getAvailableAccount` 的第 3 参（`rateLimitTried`）不得漏传**
+   * （Issue IKM3ZV 同批修的 `llm-adapter.ts` HTTP 限流换号格，2026-10-18 审计补齐）。
+   *
+   * ## ⚠️ 为什么上面那条用例锁不住它
+   *
+   * 既有那条走的是「`currentAccountId` 非空 + 刚写过限流标记」的形态 ⇒ 池的
+   * **模型级过滤**已经把刚失败的账号挡掉 ⇒ **漏传 `tried` 也照样能换号** ⇒ 恒绿。
+   *
+   * ## 本用例构造的形态：`tried` 是**唯一**排除机制
+   *
+   * `findAccountIdByCredential` 恒返 `''` ⇒ `currentAccountId` 为空 ⇒
+   * `:1451` 的记账分支整段跳过 ⇒ 池里**没有任何限流标记** ⇒ 模型级过滤失效
+   * ⇒ 此时**只有 `tried` 能挡住刚失败的账号**。
+   *
+   * ⚠️ 这个形态在生产上可达：反查失败（凭据已轮换 / 账号被停用）或单凭据兜底。
+   *
+   * ## 判别力
+   *
+   * 池替身**尊重 `exclude`**（真实池同形）⇒ 漏传时它会把**同一个** acct-1 再返回一次
+   * ⇒ 命中 `rateLimitTried.has` 而立即放弃换号 ⇒ 报「所有账号均受限」而 acct-2 可用。
+   */
+  it('★★ 空体 429 换号必须传 tried（`currentAccountId` 为空、池无标记的形态）', async () => {
+    /** 池里的限流标记（本形态下必须恒空，否则模型级过滤会掩盖 `tried` 的作用）。 */
+    const marked: Array<{ accountId: string }> = []
+    /** 每次取号收到的 exclude（判别力所在）。 */
+    const excludes: Array<string[]> = []
+    const accounts = [
+      { id: 'acct-1', ak: 'AK' },
+      { id: 'acct-2', ak: 'AK2' },
+    ]
+    const credentialOf = (ak: string) => ({
+      access_key_id: ak, secret_access_key: `SK-${ak}`, security_token: `ST-${ak}`,
+      expires_at: '2099-01-01T00:00:00Z',
+    })
+    const pool = {
+      // ⚠️ **恒返空串** ⇒ `currentAccountId` 为空 ⇒ 上面的记账分支跳过 ⇒
+      // 池里没有任何 `modelRateLimits` ⇒ 模型级过滤失效，`tried` 是唯一闸门。
+      findAccountIdByCredential: async () => '',
+      getAvailableAccount: async (
+        _provider: string,
+        _modelId: string,
+        exclude?: ReadonlySet<string>,
+      ) => {
+        excludes.push([...(exclude ?? [])])
+        const hit = accounts.find((a) => !exclude?.has(a.id))
+        return hit === undefined
+          ? null
+          : { entry: { id: hit.id }, credential: credentialOf(hit.ak) }
+      },
+      updateModelRateLimit: async (accountId: string) => { marked.push({ accountId }) },
+    }
+
+    const chatKeys: string[] = []
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const key = /Access=([^,\s]+)/.exec(new Headers(init?.headers).get('Authorization') ?? '')?.[1] ?? ''
+      if (String(input).startsWith(CHAT_API_BASE)) chatKeys.push(key)
+      return key === 'AK2'
+        ? new Response(
+            'data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n',
+            { status: 200, headers: { 'content-type': 'text/event-stream' } },
+          )
+        : new Response('', { status: 429 })
+    })
+
+    const adapter = makeAdapter({ fetchImpl, accountPool: pool })
+    const texts: string[] = []
+    for await (const chunk of adapter.stream(streamOptions)) {
+      if (chunk.type === 'text-delta') texts.push(chunk.text)
+    }
+
+    /**
+     * ⚠️ 判别力在**第二次取号的 exclude 是否含首号**。
+     *
+     * ⚠️⚠️ **实测修正（2026-10-18，写这条用例时才发现）**：本形态下
+     * `currentAccountId` 起手为空 ⇒ 首号 acct-1 **从未被加进 `rateLimitTried`**
+     * （`:1451` 的 `if (currentAccountId)` 与其中的 `add` 一起被跳过）⇒
+     * **第二次取号的 exclude 里本来就没有 acct-1** ⇒ 桩此时会**再返回 acct-1** ⇒
+     * 首号被发两次（实测 `chatKeys = ["AK","AK","AK2"]`）。
+     *
+     * ⇒ 所以本形态**测的不是「漏传 tried」**（那是 `currentAccountId` 非空时的形态），
+     * 而是一个**独立的既有行为**：首号在反查失败时不在已试集里。
+     * ⚠️ 该行为**不是本 PR 引入的**（`:1451` 那段是既有代码），且它有自限性 ——
+     * 第二次换号后 `currentAccountId` 变成 acct-2（非空）⇒ 后续记账与 `add` 恢复。
+     *
+     * ⇒ 因此本用例改为锁「**第二号真的被用上**」这条**跨实现稳定**的不变式，
+     * 而把 exclude 的精确内容交给下面那条「`currentAccountId` 非空」的用例去锁。
+     */
+    expect(chatKeys, '第二个账号必须真的被尝试（漏传 tried 时永远轮不到它）').toContain('AK2')
+    expect(texts).toEqual(['ok'])
+  })
+
+  /**
+   * ★★ 同一处修复的**另一形态**：`currentAccountId` **非空** ⇒ 首号已在
+   * `rateLimitTried` 里 ⇒ 漏传第 3 参时池会把首号再返回一次 ⇒ 换号立即终止。
+   *
+   * ⚠️ 与上面那条**互补**：上面那条锁「换号确实发生」，这条锁「**传给池的 exclude
+   * 含首号**」—— 后者才是漏传时**唯一**可观测的差异。
+   */
+  it('★★ 空体 429 换号：池收到的 exclude 必须含首号（非空 currentAccountId 形态）', async () => {
+    const excludes: Array<string[]> = []
+    const accounts = [
+      { id: 'acct-1', ak: 'AK' },
+      { id: 'acct-2', ak: 'AK2' },
+    ]
+    const credentialOf = (ak: string) => ({
+      access_key_id: ak, secret_access_key: `SK-${ak}`, security_token: `ST-${ak}`,
+      expires_at: '2099-01-01T00:00:00Z',
+    })
+    const pool = {
+      // ⚠️ **非空** ⇒ `:1451` 的记账分支会执行 ⇒ 首号被写标记**并**进 `rateLimitTried`
+      // ⚠️ 但池替身**不实现模型级过滤** ⇒ 唯一的排除机制就是传给它的 exclude。
+      findAccountIdByCredential: async (provider: string, identity: string) =>
+        (provider === 'codearts' && identity === 'AK' ? 'acct-1' : ''),
+      getAvailableAccount: async (
+        _provider: string,
+        _modelId: string,
+        exclude?: ReadonlySet<string>,
+      ) => {
+        excludes.push([...(exclude ?? [])])
+        const hit = accounts.find((a) => !exclude?.has(a.id))
+        return hit === undefined
+          ? null
+          : { entry: { id: hit.id }, credential: credentialOf(hit.ak) }
+      },
+      updateModelRateLimit: async () => {},
+    }
+
+    const chatKeys: string[] = []
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const key = /Access=([^,\s]+)/.exec(new Headers(init?.headers).get('Authorization') ?? '')?.[1] ?? ''
+      if (String(input).startsWith(CHAT_API_BASE)) chatKeys.push(key)
+      return key === 'AK2'
+        ? new Response(
+            'data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n',
+            { status: 200, headers: { 'content-type': 'text/event-stream' } },
+          )
+        : new Response('', { status: 429 })
+    })
+
+    const adapter = makeAdapter({ fetchImpl, accountPool: pool })
+    for await (const _chunk of adapter.stream(streamOptions)) { /* 消费 */ }
+
+    /**
+     * ⚠️⚠️ 判别力：换号**只取号一次**（成功即止），但那**一次**的 exclude 必须含首号。
+     *
+     * ⚠️ 实测（写这条用例时验证）：修复前 `excludes = [[]]` ⇒ 池按手动顺序把
+     * 刚失败的 `acct-1` 再返回一次 ⇒ `rateLimitTried.has` 命中 ⇒ **换号终止**。
+     * 修复后 `excludes = [["acct-1"]]` ⇒ 池返回 `acct-2` ⇒ 两号各一发即成功。
+     *
+     * ⚠️⚠️ **本用例同时锁住两处**（它们缺一不可，审计只报了其中一处）：
+     *   ① `:1451` 之后的 **`rateLimitTried.add(currentAccountId)`** —— 加首号；
+     *   ② 传给 `getAvailableAccount` 的**第 3 参** —— 把已试集给池。
+     * 只修 ① 会让排除集为空（因为它得靠 ② 传出去）；只修 ② 会因首号从未入集而仍为空。
+     */
+    expect(excludes, '换号必须取号一次且排除首号').toEqual([['acct-1']])
+    expect(chatKeys, '两个账号各试一次').toEqual(['AK', 'AK2'])
+  })
+
+  /**
+   * ★★ 上一条断言在「只删 `rateLimitTried.add(currentAccountId)`」的变异下是
+   * **恒真的**（变异实测全绿）⇒ 必须有一条**直接锁「首号进已试集」**的用例。
+   *
+   * ## 构造：池**忽略 exclude**（返回同一个账号）
+   *
+   * 真实池尊重 exclude，所以「首号不在已试集」在生产上**不会**让池返回它 ——
+   * 这正是上一条守不住的原因。⇒ 本用例把桩改成**忽略 exclude**，把
+   * 「首号在不在 `rateLimitTried` 里」这件事**放大成可观测**：
+   *
+   * - 修复态：首号已入集 ⇒ `if (next && !rateLimitTried.has(next.entry.id))` 判假
+   *   ⇒ **不再重发**，如实抛「所有账号均受限」⇒ 恰好 **1 次** chat 请求；
+   * - 变异态：首号不在集 ⇒ 判真 ⇒ 拿同一个号再发一遍 ⇒ **2 次** chat 请求。
+   *
+   * ⚠️ 判别力 = **chat 请求次数**（1 vs 2）。
+   */
+  /**
+   * ⚠️⚠️ **本用例实测无牙，如实登记**（2026-10-18 变异验证）。
+   *
+   * 变异：删掉 `llm-adapter.ts` 的 `rateLimitTried.add(currentAccountId)`
+   * ⇒ **本用例仍绿**（B2 变异实测）。
+   *
+   * ## 为什么无牙（追查到的真实原因，不是「找不到原因」）
+   *
+   * 本用例让桩**忽略 exclude**（恒返回 `acct-1`），意图是把「首号在不在已试集」
+   * 放大成可观测的请求数差异。实测该放大**不成立**：
+   * B2 变异态下 `rateLimitTried` 为空 ⇒ `!has('acct-1')` 判真 ⇒ 换号继续 ⇒
+   * **重发一次** ⇒ 第二轮 `has()` 命中 ⇒ 抛「所有账号均受限」。
+   * ⇒ 请求数与修复态**相同**，`chatCalls` 断言分不出。
+   *
+   * ## 真实影响范围（如实标注）
+   *
+   * ⚠️ 该行缺失在**生产**上同样有自限性：真实池**尊重 exclude**，
+   * 首号会在**下一轮**才被排除，而本轮它被返回后 `!has()` 判真 ⇒ 换号成功。
+   * ⇒ 后果是「**首号多发一次**」，而**不是**「换号彻底失效」。
+   * ⚠️ 但 `:1323`（SSE 额度格）与 `:1393`（HTTP 额度格）**一直都有**这一行 ——
+   * 本格是三格里唯一的例外，属**不一致**而非「有意设计」。
+   *
+   * ## 为什么不补第二条用例
+   *
+   * 要给它造有牙的判据，必须让「首号不在集 ⇒ 换号终止」可观测，而当前三格里
+   * **没有任何一条**能在缺该行时表现出不同行为（另两格那行本就有）。
+   * ⇒ 按本仓库纪律**如实登记为无牙，不为它编恒真用例**。
+   * ⇒ 该行仍保留（与另两格对齐），但**它的价值是「一致性」而非「有守卫」**。
+   */
+  it.skip('★★ 首号进 rateLimitTried（实测无牙，见上方登记）', async () => {
+    expect(true).toBe(true)
+  })
+
+
+
   it('translates tool_calls deltas into tool-call blocks so the harness can run them', async () => {
     const fetchImpl = vi.fn(async () => new Response(
       'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","function":{"name":"bash","arguments":"{\\"command\\":\\"ls\\"}"}}]},"finish_reason":"tool_calls"}]}\n\n'

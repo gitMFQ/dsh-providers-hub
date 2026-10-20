@@ -31,6 +31,7 @@ import { ZCODE } from './zcode-product.js'
 import { ZCODE_CAPTCHA_FALLBACK, type ZcodeCaptchaConfig } from './zcode-captcha.js'
 import type { CarrierOutcome } from './captcha-carrier.js'
 import { AccountPool, allAccountsRateLimitedForModel } from './account-pool.js'
+import { geminiFetchForAccount, setGeminiProxyPool } from './gemini-proxy.js'
 import { MultiAccountRefreshScheduler } from './refresh-scheduler.js'
 import { hasLegacyNamespaceRegistration, settingsOf, suppressAutoSettingsPage } from './settings-compat.js'
 import { DEFAULT_BODY_LIMITED_IMAGE_MAX_BYTES, type ImageRequestTarget } from './image-budget.js'
@@ -107,9 +108,16 @@ import { registerAutoclawLlm } from './autoclaw-adapter.js'
 import { AUTOCLAW } from './autoclaw-product.js'
 import type { AutoclawCredential } from './autoclaw.js'
 import { AccioAuth } from './accio-auth.js'
-import { registerAccioLlm } from './accio-adapter.js'
+import { AccioAdapter, registerAccioLlm } from './accio-adapter.js'
 import { ACCIO } from './accio-product.js'
 import type { AccioCredential } from './accio.js'
+// AStudio（讯飞 AstronStudio）：直连上游 MAAS。**没有 OAuth 授权页** —— 推理凭据是
+// 本机客户端登录后明文落盘会话的一份拷贝（见 astudio-auth.ts 模块头）。
+// 本家符号分属四个模块：auth 服务在 astudio-auth.ts、适配器注册在 astudio-adapter.ts、
+// 产品常量在 astudio-product.ts、纯函数与凭据类型在 astudio.ts。
+import { AstudioAuth } from './astudio-auth.js'
+import { registerAstudioLlm } from './astudio-adapter.js'
+import { ASTUDIO } from './astudio-product.js'
 // ⚠️ **本 fork 独有**的 provider（上游 rc.11 仍无 modelscope）。
 // 见 `docs/agent-notes/providers-modelscope.md` 与 `src/modelscope-product.ts` 模块头的逐条出处表。
 import { ModelscopeAuth } from './modelscope-auth.js'
@@ -142,7 +150,11 @@ import { AGGREGATE_PROVIDER, registerAggregateLlm } from './aggregate-adapter.js
 import { createExpiryProbe } from './aggregate-expiry.js'
 // ⚠️ 共享余额读数缓存（2026-10-15，规格 §5.7）：装配层建**一个**实例，
 //    `credits.balances` 端点与 buddy 系四家的折算共用它（见下面 `balanceCache` 的长注释）。
-import { createBalanceCache, type BalanceCacheEntry } from './balance-cache.js'
+import { createBalanceCache, createBalanceRefresher, REFRESH_PERIOD_FALLBACK_MS, type BalanceCacheEntry } from './balance-cache.js'
+// ⚠️ 模型目录的后台刷新器（用户 2026-10-18 要求：20 分钟定时更新）。
+//    与余额刷新器**共用同一套骨架**（武装 + 单飞 + 幂等），但**不复用实例** ——
+//    余额缓存 key 是 `(provider, accountId)`、目录的 key 是 provider，语义不同。
+import { createCatalogRefresher } from './model-catalog.js'
 // ⚠️ 中止判据复用适配器的**共享实现**（`aggregate-adapter.ts` 的 `isAbortLike`）：
 //    本仓库已有 4 份同义实现，装配层不该再添第五份。
 import { isAbortLike as isAbortLikeError } from './aggregate-adapter.js'
@@ -516,13 +528,27 @@ export const probeById: Record<string, NonNullable<ProviderRuntime['probe']>> = 
   // 会让探测报「项目号探测失败」而不是它真正要报的「账号仍受限」—— 反而掩盖
   // 了用户点「重测」想知道的答案。探测**不写**任何东西（不传 persistProject）。
   gemini: {
-    createProbeAdapter: (ref, credential) => new GeminiAdapter({
+    // ⚠️ **第三个形参 `entry` 不能丢**（IKLTZ2 审计 P1-1，真实缺陷）：
+    // 探测路径**刻意不传 `accountPool`**（`account-probe.ts` 的既定语义：
+    // 只测这一个账号、且不写任何标记）⇒ 适配器内那条「按 access_token 反查
+    // 账号 id」的路**根本不存在** ⇒ 出口解析器拿到空 id、按「直连」处理
+    // ⇒ **该账号的代理被完全绕过**。
+    // 症状与 issue 原话同形：墙外环境下「测试 / 重测」**恒失败**，而这个失败
+    // 与「账号已失效」在 UI 上完全同形 ⇒ 用户会去误删好号。
+    //
+    // ⚠️ 对照 opencode 的 `(ref, credential, entry)`（下方 L649）：它接下了
+    // entry 并把 `entry.opencodeProxy` 喂进槽里，本家原先漏了这一步。
+    createProbeAdapter: (ref, credential, entry) => new GeminiAdapter({
       credentialRef: credentialRef(ref),
       resolveCredential: async () => credential as GeminiCredential,
       refresh: async () => {},
       sessionLane: GEMINI_SESSION_LANE_SMOKE,
       project: GEMINI_DEFAULT_PROJECT,
       product: GEMINI,
+      // ⚠️ **探测必须走该账号的代理**：账号卡片上的「测试 / 重测」按钮打的是
+      // 真实推理端点，而 Gemini 全部端点都在墙外。
+      fetchFor: geminiFetchForAccount,
+      accountIdOverride: entry?.id ?? '',
     }),
   },
   // CodeArts → 华为云 HMAC 签名（**它自己的**签名方案，不是「兜底」）。
@@ -579,6 +605,23 @@ export const probeById: Record<string, NonNullable<ProviderRuntime['probe']>> = 
       resolveCredential: async () => credential as MinimaxCredential,
       refresh: async () => {},
       product: MINIMAX_INTL,
+    }),
+  },
+  // Accio（阿里）→ 自己的网关端点。
+  //
+  // ⚠️ 它**曾经**不必在这里（issue IKM3ZV 之前：适配器不写 `modelRateLimits`，
+  // `provider-registry.ts` 的 `rateLimit: false` 与 `WRITES_RATE_LIMIT_PROVIDERS`
+  // 都据此把它排除）。2026-10-18 接上请求级换号 + 冷却后它**会写**标记
+  // （额度至 UTC+8 当日 24:00 / 限流 1h）⇒ 必须登记，否则标记写进去却清不掉。
+  //
+  // ⚠️ 刻意**不传** `accountPool`（与 minimax 同一理由）：那会让 `stream()` 的
+  // 反查与轮换在探测路径上复活（探测失败若写回限流标记，会把「重测 A 账号」
+  // 变成污染池的副作用）。也**不传** `fetchRemoteModels` / `readImage`。
+  accio: {
+    createProbeAdapter: (ref, credential) => new AccioAdapter({
+      resolveCredential: async () => credential as AccioCredential,
+      refresh: async () => {},
+      product: ACCIO,
     }),
   },
   // OpenCode Zen。
@@ -740,6 +783,63 @@ export function apply(ctx: Context): void {
   //   `ProviderRuntime.credits` 同一张表（见 `provider-runtime.ts` 的说明）。
   //   ⚠️ 未注册 ⇒ 端点回退到自己的原路径（行为与升级前一致）—— 那是刻意的降级。
   registerBalanceCache(balanceCache)
+
+  /**
+   * ★★ **余额缓存的后台刷新器**（2026-10-18，Task 2）。
+   *
+   * ## 为什么必须有它（用户原话）
+   *
+   * 「这个 2 分钟是 interval 不是 timeout」—— 原实现是 cache-aside（读驱动），
+   * 而读路径在提交 `a725101` 之后陈旧命中**一个请求都不发** ⇒ 没有任何东西会再取
+   * 新数据 ⇒ 缓存会永远陈旧。本刷新器补上「后台保鲜」那一半。
+   *
+   * ## ⚠️ 位置不变式
+   *
+   * 必须建在 `balanceCache` **之后**：它要拿缓存实例（与上面那条位置不变式同源）。
+   *
+   * ## ⚠️ 凭据必须**在装配层解析**
+   *
+   * `fetchBalanceReading`（本文件下方）在 `entry.credential === undefined` 时
+   * 直接抛「凭据未提供」⇒ 刷新器若传空 entry，**每一轮都被记成失败读数**
+   * （外面看「刷新器在跑」，实则永远拿不到新值 —— 零报错的恒绿形态）。
+   * ⇒ 这里按 `credentialRef` 解析（与 `jet-hub-rpc.ts` 的
+   *   `resolveCredentialForCache` **同款**口径）；解析失败返回 undefined，
+   *   刷新器据此**跳过**该账号（那一枪必然失败，纯浪费）。
+   */
+  const balanceRefresher = createBalanceRefresher(balanceCache, {
+    // ⚠️ `listAllAccounts()` 实测是 **async**（`src/account-pool.ts:1308`）；
+    //    刷新器内部一律 `await`，直接传引用即可。
+    // ⚠️ 传**全部**账号（含停用）：停用只影响自动选号（仓库铁律「续期不得按
+    //    `enabled` 过滤」），凭据仍需保鲜 —— 由刷新器自己判低频节奏。
+    listAccounts: () => pool.listAllAccounts(),
+    resolveCredential: async (refName) => {
+      const resolved = await ctx.credentials.resolve(credentialRef(refName))
+      if (resolved === undefined) return undefined
+      try {
+        return JSON.parse(resolved.value)
+      } catch {
+        return undefined
+      }
+    },
+    // ⚠️ **引用常量、不要重打 `60_000`**（2026-10-18 复审 Minor 修正）：
+    //    装配层与 `createBalanceRefresher` 各写一份同一个字面量，等于把
+    //    `DEFAULT_STALE_TTL_MS` 刚消灭掉的那类重复又引入了一次。
+    //    ⚠️ **理由（别丢）**：周期 = 共享缓存 `ttlMs`(120s) 的**一半** ——
+    //    周期恰等于 `ttlMs` 时条目在刚过期那一刻才被刷，读路径仍会频繁撞上
+    //    「陈旧且后台刚开始刷」，常新目标落空；取一半 ⇒ 任何时刻至少有半个周期余量。
+    intervalMs: REFRESH_PERIOD_FALLBACK_MS,
+    // ⚠️⚠️ **日志必须接上**：刷新器把失败吞掉并记日志（后台没有调用方可通知）
+    //    ⇒ 不接 logger 就是**完全静默**：面板只显示「查询失败」，用户与维护者
+    //    都看不到「后台刷新器压根没在刷」。这两行同时是接线守卫的判据落点。
+    info: (message) => ctx.logger?.info?.(message),
+    warn: (message) => ctx.logger?.warn?.(message),
+  })
+  // 生命周期挂 `ctx.effect`，与插件一致（释放后停手）—— 与既有 `modelsDevTimer`、
+  // `startCatalogPrewarm` 同款约定。
+  ctx.effect(() => {
+    balanceRefresher.start()
+    return () => { balanceRefresher.stop() }
+  })
 
   // CodeArts 目录的**各来源成败**出参（issue IKJVTF 复审，审计 I3）：
   // `service.refreshModels` 每轮原地写入，适配器的 `catalogComplete` 读它。
@@ -1362,6 +1462,11 @@ export function apply(ctx: Context): void {
     readImageRequest: makeReadImageRequest(ctx),
     accountPool: pool,
     product: QODER,
+    // 远端模型目录（2026-10-20）：**由 auth 服务取数**，只做池的只读读取。
+    // ⚠️ 刻意**不**走 `resolveCredential` —— 它选中账号时会 reportAccount，
+    //    而目录请求是周期性的（20 分钟刷新器），会把「本次实际使用的账号」
+    //    改写成目录用的账号 ⇒ 额度标记落到无辜账号上（见 `QoderAdapterOptions.fetchRemoteModels`）。
+    fetchRemoteModels: () => qoder.fetchModels(pool),
     // 额度受限时标记「本次实际使用的账号」（理由见 `activeQoderAccountId` 注释）。
     currentAccountId: () => activeQoderAccountId.get(QODER.id),
   })
@@ -1422,6 +1527,8 @@ export function apply(ctx: Context): void {
     readImageRequest: makeReadImageRequest(ctx),
     accountPool: pool,
     product: QODER_CN,
+    // 远端模型目录：同国际版（两站共用同一套实现，差异只在产品配置）。
+    fetchRemoteModels: () => qoderCn.fetchModels(pool),
     // 额度受限时用它标记「当前账号」（见 `QoderAdapter.switchAccountOnQuota`）。
     // ⚠️ 取「**本次实际使用**的账号」而非池里默认那一个：池的默认账号可能与之
     // 不同（例如本账号被限流、池已切到别的账号），标错就会让标记落在无辜账号上。
@@ -2011,7 +2118,12 @@ export function apply(ctx: Context): void {
   //
   // 服务名由 GeminiAuth 依 product.id 派生，注册为 ctx.geminiAuth。
   // 不注册斜杠命令：入口在 Jet Hub 的 Gemini 面板。
-  const gemini = new GeminiAuth(ctx)
+  //
+  // ⚠️ Gitee issue IKLTZ2：Gemini 全部端点都在墙外，而 undici 既不读 Windows
+  // 系统代理、也不读 `HTTP(S)_PROXY` ⇒ 「浏览器授权成功、面板里账号一直不出现」。
+  // 这里接上**按账号取 fetcher** 的解析器（与 `probeById` 共用同一份）。
+  setGeminiProxyPool(pool)
+  const gemini = new GeminiAuth(ctx, { fetchFor: geminiFetchForAccount })
   const geminiSigStore = createGeminiSigStore(ctx)
   // ⚠️ 项目号探测缓存必须**在这里建一次、长期复用** —— 每次 `stream()` 现造
   // 等于没有跨请求缓存，每轮推理都会多打一次 `loadCodeAssist`。
@@ -2072,6 +2184,8 @@ export function apply(ctx: Context): void {
     // 项目号：缺省**自动探测**（`loadCodeAssist` 的 `cloudaicompanionProject`），
     // 不是恒为 `aicode-consumers`（那只是探测为空时的兜底）。
     projectCache: geminiProjectCache,
+    // ⚠️ **推理主路径的出口**（IKLTZ2）：此前这里只有裸 `fetch`（连 seam 都没有）。
+    fetchFor: geminiFetchForAccount,
     persistProject: async (value: string) => {
       // ⚠️ 回写到**解析凭据时所用的那个账号**，不是默认单凭据 ref ——
       // 写错对象会让另一个账号的凭据被污染。
@@ -2213,6 +2327,43 @@ export function apply(ctx: Context): void {
     //    ⚠️ 泛型参数（`AccioCredential`）与上面 `resolveCredential` 一致。
     readImage: makeReadImage(ctx),
     readImageRequest: makeReadImageRequest(ctx),
+  })
+
+  // ===== AStudio（讯飞 AstronStudio，云端直连上游 MAAS）=====
+  //
+  // 形态与 OfficeAce / Accio 同类：进程内 LlmAdapter 直发远端，无子进程、无端口。
+  // 独有语义：**没有 OAuth 授权页**，凭据来自本机 AStudio 客户端的明文会话文件；
+  // Jet Hub 的 account.create 因此走 importLocalSession（见 jet-hub-rpc.ts）。
+  //
+  // 服务名由 AstudioAuth 依 product.id 派生（astudioAuth）并在构造时自注册，
+  // 故这里**不需要**再 ctx.provide('astudioAuth' / 'astudioLlm')。
+  // 不注册斜杠命令：入口在 Jet Hub 的 AStudio 面板。
+  const astudio = new AstudioAuth(ctx)
+  const astudioAdapter = registerAstudioLlm(ctx, {
+    // ⚠️ AstudioAdapterOptions 只有 product / fetchImpl / auth / resolveCredential /
+    //    refresh / fetchRemoteModels / onCatalogLoaded / warn 八项 —— **没有**
+    //    accountPool 与 readImage（与上面 accio 那两处不同，多传必 TS2353：
+    //    本家适配器刻意不做请求级换号，且实测六个模型的 input_modalities 全是
+    //    text，图片通路不成立）。
+    // ⚠️ **不传 onCatalogLoaded**：registerAstudioLlm 内部已注入唯一的
+    //    broadcastCatalogChanged(ctx)，这里再传就是第二份广播。
+    // ⚠️ 传 auth 即可拿到三个默认回调（currentCredential / refreshOnce /
+    //    fetchCatalogModels），下面只覆盖确实需要定制的那一个。
+    auth: astudio,
+    product: ASTUDIO,
+    refresh: async () => {
+      // ⚠️ 必须返回 AstudioRefreshOutcome：本家 401 的唯一入口是 refreshOnce
+      //    （**不抛**，以 credential/terminal/reason 回传），**不是**返回
+      //    Promise<void> 的 refreshAccountCredential —— 后者的签名与语义都不匹配
+      //    该形参（TS2322），且它会把终态错误抛进适配器。
+      // ⚠️ 刷的必须是「解析凭据时所用的那一个」账号（同上面 accio 处说明）；
+      //    池里没有账号时退到默认单凭据 ref。
+      const available = await pool.getAvailableAccount(ASTUDIO.id, '')
+      return await astudio.refreshOnce(
+        available?.entry.credentialRef ?? ASTUDIO.defaultCredentialRef,
+      )
+    },
+    warn: (message: string) => { ctx.logger?.warn?.(message) },
   })
 
   // ===== ModelScope（魔搭）—— **本 fork 独有** =====
@@ -2795,6 +2946,8 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
     // ⚠ 必须 dispose captcha 浏览器 —— 否则会留下孤儿 chromium
     //（约 200-400 MB，且用户没有界面能关掉它）。
     zcodeAdapter.stop()
+    // AStudio（讯飞）的 stop() 置 active=false，阻止在途刷新回写凭据。
+    astudio.stop()
   }, 'jet-hub: multi-account refresh scheduler')
 
   // 保留旧的 stop scheduler（兼容旧命令）
@@ -2811,6 +2964,8 @@ const zcodeAdapter = registerZcodeLlm(ctx, {
     zcode.stop()
     // 同上：captcha 浏览器必须随插件一起回收。
     zcodeAdapter.stop()
+    // 同上：AStudio 的在途刷新必须随插件一起回收。
+    astudio.stop()
   }, 'codearts-auth.scheduler (legacy)')
 
   // ===== OfficeAce（华为 ModelArts MaaS，云端直连）=====
@@ -3164,10 +3319,13 @@ async function fetchBalanceReading(
   // ⚠️ `ProviderCallContext` 的三个字段与 `jet-hub-rpc.ts` 里那份**同形**
   //（那里是端点闭包内的注册实例，这里是装配层的实例；实现侧只需一个形状）。
   // ⚠️ 必须与端点那份**指向同一个池**，否则折算拿到的账号集合与面板看到的不一致。
+  // ⚠️ `accountId` **必须带上**（Gitee issue IKLTZ2）：Gemini 折算路径要按账号
+  // 取出口代理；漏了它 ⇒ 这条路径恒直连，症状是「面板能刷新、聚合折算却失败」。
   const callContext = {
     resolveCredential: (refName: string) => ctx.credentials.resolve(credentialRef(refName)),
     warn: (message: string) => ctx.logger?.warn?.(message),
     accountPool: pool,
+    accountId: entry.id,
   }
   // ⚠️ `fetchBalanceDetailed` 优先（它带 `error` / `extra`，是既有端点的口径）。
   if (impl.fetchBalanceDetailed !== undefined) {
@@ -3225,11 +3383,39 @@ async function fetchBalanceReading(
      * 「只给可用账号」这一取舍由 `createExpiryProbe` 自己的取号逻辑决定
      *（它本来就只遍历可用账号），与缓存无关。
      *
-     * ⚠️ 返回 `undefined` ⇒ 取数失败 ⇒ 实现方回落到自己发请求：折算的**可用性**
-     * 不得依赖本缓存（否则缓存不可用会静默变成「该渠道折算恒 UNUSABLE」）。
+     * ⚠️ 返回 `undefined` ⇒ **本次没有共享读数** ⇒ 实现方回落到自己发请求
+     * （`fetchBalanceWithCache`，见 `aggregate-expiry.ts:275` 的契约）：
+     * 折算的**可用性**不得依赖本缓存（否则缓存不可用会静默变成「该渠道折算恒 UNUSABLE」）。
+     * ⇒ 而返回 **`null`** 是「结论：这个账号现在不可用」（`sharedPackageExpiry`
+     * 对 `null` 判 `UNUSABLE`，且**不**回落重查）—— 下面那条正是这一格。
      */
     balanceOf: async (provider, accountId, credential) => {
       const reading = await balanceCache.readOne(provider, accountId, { credential })
+      // ★★ **陈旧读数不得参与折算**（2026-10-18）。
+      //
+      // 读路径改成 stale-while-revalidate 后，缓存陈旧时折算会拿到**旧值**，
+      // 而 `stale` 字段原先只在 `readStale` 里判（`balance-cache.ts` 的注释记着
+      // 那个限制）⇒ 折算会**静默地长期用 10 分钟前的数字排序**。
+      //
+      // ⚠️⚠️ **必须返回 `null` 而不是 `undefined`**（实测确证，2026-10-18）：
+      //   契约（`aggregate-expiry.ts:275`）与实现（`fetchBalanceWithCache`）都规定
+      //   `undefined` = 「**本次没有共享读数**⇒ 回落到自己发请求」，`null` 才是
+      //   「结论：不可用」。实测（mock `fetchCreditBalance` 成功）：
+      //     - 返回 `undefined` ⇒ fallback **被调用 1 次**，折算返回**上游的值**（≠ UNUSABLE）
+      //     - 返回 `null`      ⇒ fallback **0 次**，折算返回 `-1`（UNUSABLE）
+      //   ⇒ 写 `undefined` 会得到「陈旧账号每次折算**多打一次上游请求**」，
+      //     恰恰是本条要消灭的行为（且与「读路径一个请求都不发」相悖）。
+      //
+      // ⚠️ 与 officeace 分支的既有约定同构（`aggregate-expiry.ts:1141`：
+      // 「`summary.stale === true` ⇒ 判 `UNUSABLE`」）。同一次改动在别处新增了
+      // 这条、而面板出口把两天前的快照当实时余额显示，被审计记为
+      // 「**同一份数据两层结论相反**」（`jet-hub-rpc.ts:5462`）——
+      // 本行就是避免复发的那一腿。
+      //
+      // ⚠️ **有意的行为代价（如实登记）**：折算可能因陈旧读数而少一个候选渠道，
+      // 用户表现为**聚合轮换里某个渠道暂时不出现**。这比「用 10 分钟前的数字
+      // 排序」安全，且与 officeace 既有行为一致（用户 2026-10-18 明确接受）。
+      if (reading.stale === true) return null
       return reading.error === undefined ? reading.value : undefined
     },
   })
@@ -3326,6 +3512,8 @@ async function fetchBalanceReading(
     modelscope: pruned(MODELSCOPE.id, modelscopeAdapter),
     // OfficeAce（华为 MaaS 云端直连）：目录静态 + 平台侧可用性，同其余渠道。
     officeace: pruned(OFFICEACE.id, officeAceAdapter),
+    // AStudio（上游 MAAS 云端直连）：目录来自 model-manager 远端 + 兜底表，同其余渠道。
+    astudio: pruned(ASTUDIO.id, astudioAdapter),
     // ⚠️ 聚合 provider 也必须进这张表（设计文档 §5.2 的必改点）：`jet-hub-rpc.ts` 的
     // `fullCatalogIds` **优先**用本表的 `listAllModels()`（不套黑名单的全量目录），
     // 缺失时才退化到 `llm.listModels(provider)` —— 后者已被适配器按黑名单过滤。
@@ -3356,6 +3544,55 @@ async function fetchBalanceReading(
     //    「编译期兜底快照跟不上上游下架」那套记录/过滤机制对它没有意义。
     'jet-hub-auto': pruned(AUTO_PROVIDER, autoAdapter, { enabled: false }),
   }
+
+  /**
+   * ★ **模型目录的后台刷新器**（用户 2026-10-18 的要求）。
+   *
+   * 「各个模型的模型列表缓存也要带定时更新，20 分钟更新一次，如果不更新随高峰低谷
+   * 变化的积分消耗倍率是更新不到实际的倍率」
+   *
+   * ## ⚠️ 为什么必须建在 `modelAdapters` **之后**（位置不变式）
+   *
+   * 它要读那张表拿实例。早于建表 ⇒ 空表 ⇒ **目录永不刷新、且零日志**
+   * （与 `wiredRefreshTargets()` 前身在 2026-10-15 踩的坑同型）。
+   *
+   * ## ⚠️ 为什么走 `modelAdapters` 而不是 `ctx.llm`
+   *
+   * `ctx.llm` 是 DSH 的公开面，**不认识** `refresh()`（那是本插件给目录契约加的可选成员）。
+   * 而 `modelAdapters` 的每一项都是 `pruned()` 的 Proxy —— 它对**其余成员原样透传并绑定
+   * `this`**（`src/dead-model-store.ts:748-749`），故新加的 `refresh()` 能自动透出来。
+   *
+   * ## ⚠️ 未实现 `refresh` 的 provider 必须跳过
+   *
+   * `opencode` 这类本地派生渠道（零网络）本就没有远端可拉。对它们空转会让
+   * 「刷新器说跑了 9 家、实际只刷了 3 家」**完全静默**。
+   */
+  const catalogRefresher = createCatalogRefresher({
+    listProviders: () => Object.keys(modelAdapters),
+    refreshOf: (provider) => {
+      const adapter = modelAdapters[provider] as { refresh?: () => Promise<void> } | undefined
+      const refresh = adapter?.refresh
+      // ⚠️⚠️ **`undefined` 只能表示「这家没有该成员」**（2026-10-20 修正）：
+      //    刷新器据此统计「本轮几家真的参与」，**零参与即 warn**
+      //    （见 `createCatalogRefresher` 的注释）。故**不要**写成
+      //    `return adapter?.refresh?.()` —— 那会让「成员存在但同步返回 void」
+      //    与「成员根本不存在」不可区分，统计随之失真。
+      //    ⚠️ 而本仓库实测的失效形态恰恰是「成员根本不存在」：`be42b25` 给
+      //    `createModelCatalog` 的 config 加了 `refresh` 回调，却**没有**把它
+      //    转发成适配器实例的成员，而该提交的注释误以为 `pruned()` 的 Proxy
+      //    会把它透出来（Proxy 只透传适配器**自己的**成员）。
+      if (typeof refresh !== 'function') return undefined
+      return Promise.resolve(refresh.call(adapter)).then(() => undefined)
+    },
+    info: (message) => ctx.logger?.info?.(message),
+    warn: (message) => ctx.logger?.warn?.(message),
+  })
+  // ⚠️ 生命周期挂 `ctx.effect`，与插件一致（释放后停手）——
+  //    与既有 `modelsDevTimer`、余额刷新器同款约定。
+  ctx.effect(() => {
+    catalogRefresher.start()
+    return () => { catalogRefresher.stop() }
+  })
 
   // 插件卸载前把签名缓存落盘：`stream()` 每次结束都 flush，但用户可能
   // 直接关掉 DSH 而上一轮的 flush 还在排队 —— 落一次盘几乎零成本，
@@ -3445,6 +3682,10 @@ async function fetchBalanceReading(
     //
     // ⚠️ 惰性读（用户随时可能改设置），不能固化成字符串。
     minimaxXff: () => pool.minimaxXff(),
+    // ⚠️ Gemini 的按账号 fetcher（Gitee issue IKLTZ2）：**折算路径**也要走代理，
+    // 否则「面板能刷新、聚合候选却恒折算失败」—— 与上面 minimaxXff 同型陷阱
+    // （这里也正是它第一次被引入的同一个 `createProviderCredits` 调用）。
+    geminiFetchFor: geminiFetchForAccount,
   })
   /**
    * **一次性奖励**能力表（Loomy 新手任务 / raccoon 登录奖励）。
@@ -3585,6 +3826,13 @@ async function fetchBalanceReading(
       ['officeace', officeaceAuthService as unknown as JetHubAuthLike],
       ['autoclaw', autoclaw],
       ['accio', accio],
+      // AStudio（讯飞 AstronStudio）：值是 AstudioAuth 服务实例 —— 它已在构造时
+      // provide 自己（服务名 astudioAuth），必须与 registerJetHubRpc 的 auths.astudio
+      // 是**同一个对象**，否则守卫用例布在该实例上的 spy 收不到本循环的调用。
+      // 实测签名可结构化匹配 JetHubAuthLike（refreshAccountCredential(refName, pool?,
+      // accountId?) 的可选形参可接收必填实参；refreshAll(pool) 完全一致），
+      // 故**不需要**上面 officeace 那样的 as unknown as JetHubAuthLike 包装。
+      ['astudio', astudio],
       // ⚠️ **本 fork 独有**的 provider（上游 rc.11 仍无 modelscope）。
       //    漏加这一行 = 它不出现在注册表里 ⇒ 续期/积分/探测三条链路全部静默失效。
       ['modelscope', modelscope],
@@ -3695,6 +3943,7 @@ async function fetchBalanceReading(
     officeace: officeaceAuthService as never,
     autoclaw,
     accio,
+    astudio,
     // ⚠️ **本 fork 独有**（modelscope，2026-10-16）。漏加 = 客户端把它当
     //    「客户端已登记但宿主没有同名键」⇒ zcode-wiring 的守卫会红，
     //    且 Jet Hub 的 modelscope 面板所有 RPC 全部 `unknown provider`。

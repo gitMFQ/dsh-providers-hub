@@ -54,7 +54,7 @@ import type {
   StreamChunk,
 } from '@deepseek-ai/dsh-llm'
 import { AccountPool } from './account-pool.js'
-import { createModelCatalog, type CatalogEntry, type ModelCatalog } from './model-catalog.js'
+import { createModelCatalog, isCatalogFreshFor, type CatalogEntry, type ModelCatalog } from './model-catalog.js'
 // ⚠️ 对外 id 的归一规则**必须与聚合共用**（见 `accioModelIdOf` 的注释）。
 import { normalizeNameKey } from './canonical-models.js'
 import { RemoteCatalogGate } from './remote-catalog-gate.js'
@@ -85,6 +85,10 @@ import {
   toAccioTools,
 } from './accio-messages.js'
 import { normalizeHarnessMessages } from './message-shape.js'
+// ⚠️ 额度冷却终点复用**仓库唯一实现**（UTC+8 当日 24:00），与 zcode / qoder /
+// codearts / loomy 同款。**不**自己算「现在 + 24h」—— 那是 IKL80H 记过的
+// 「滑动 24h 让 0 点后仍报未到重置时间」缺陷。
+import { nextUtc8DayStartMs } from './model-queue.js'
 // ⚠️ 图片守卫必须复用**共享的递归收集器**（它按 `tool-result` 递归下钻）——
 // 本仓库其余适配器（buddy / lobsterai / trae / gemini / cline / qoder / …）全部走它，
 // 不在这里手写第三份判据（「同一语义两套判据」是首条红线）。
@@ -110,6 +114,18 @@ export const ACCIO_PROVIDER = 'accio'
  * 归 `TIMEOUT`（可重试）。
  */
 export const ACCIO_SSE_IDLE_TIMEOUT_MS = 120_000
+
+/**
+ * 单次用户请求最多尝试的账号数（含首号）。
+ *
+ * ⚠️ 与 loomy / raccoon / minimax 同语义，设上限**只为防病态池**：正常情况下
+ * `tried` 集合本身就有界（池里没有未试过的账号时 `getAvailableAccount` 返回
+ * `null` ⇒ 循环自然终止），这条是第二道闸。
+ */
+const ACCIO_MAX_ROTATE = 8
+
+/** 429 限流冷却：1 小时（与 loomy / raccoon / trae soft-rate 同档）。 */
+const ACCIO_RATE_LIMIT_COOLDOWN_MS = 3_600_000
 
 /**
  * 进程内稳定的 `utdid`（设备标识）兜底值。
@@ -307,6 +323,15 @@ export interface AccioAdapterOptions {
   utdid?: string
   /** 产品配置；默认 {@link ACCIO}。 */
   product?: AccioProduct
+  /**
+   * 时钟（注入以便单测推进目录 TTL；缺省 `Date.now`）。
+   *
+   * ⚠️ 只用于**目录新鲜度**（`ensureRemoteModels` 的 `isCatalogFresh`），
+   *    不用于超时/退避计时 —— 那些仍走真实时钟。
+   *    ⚠️ **buddy 是例外**：它的 `catalogGate` 也吃这个时钟（冷却与
+   *    「距上次尝试 ≥10 秒」判定都走它），所以别把本行当成全仓库通用口径。
+   */
+  now?: () => number
   /**
    * 远端目录**落地后**的通知回调（issue IKJVTF）。
    *
@@ -548,6 +573,78 @@ function httpErrorCode(status: number): string {
   if (status === 400) return 'INVALID_REQUEST'
   if (status >= 500) return 'SERVER'
   return `HTTP_${status}`
+}
+
+// ── 请求级账号轮换（issue IKM3ZV，2026-10-18）────────────────────────────
+//
+// ## 为什么必须有这一段
+//
+// 修复前本适配器**整条请求路径零换号**：`resolveCredential` 取回一个账号 →
+// 不成即抛错。实测复现（issue IKM3ZV）：池里两个启用账号，首号额度耗尽
+// （`402`）后，**第二个账号从未被尝试**，整轮直接失败 ——「登录 N 个账号
+// 并未带来 N 倍可用性」。全仓 18 个 `*-adapter.ts` 里当时只有 3 家
+// （accio / autoclaw / officeace）没有换号循环。
+//
+// ## 语义表（照 `minimax-adapter.ts` / `loomy-adapter.ts` 的类别→动作表逐格搬）
+//
+// | 类别 | 判据 | 换号 | 写冷却 |
+// |---|---|---|---|
+// | `quota` | 402 / 流内 `error_code:402` | ✅ | ✅ 至 UTC+8 当日 24:00 |
+// | `rate`  | 429 | ✅ | ✅ 1h |
+// | `auth`  | 401 / 403 | ✅ | ❌ **绝不写** |
+// | `other` | 其余（400 参数错、5xx、风控拦截页…） | ❌ | ❌ |
+//
+// ⚠️ **认证类只换号、绝不写冷却**是 2026-10-06「全池被封」事故换来的不变式：
+// 上游网关对**全池**回 401 时，若每个号都被写长冷却，一个请求就能把整个
+// provider 封一天。这与 loomy / raccoon / minimax 同一条铁律。
+//
+// ⚠️ **本表按 `status` 判、**不**再扫报文文案**（与 minimax / loomy 的四通道
+// 判据刻意不同）：本家的两条通道已经把类别**穷尽**了 ——
+//   - HTTP 层：`httpErrorCode` 已把 401/402/403/429 各自映射成固定错误码；
+//   - 流内层：`accioErrorFrame` 只把 `error_code === '402'` 认作额度，其余
+//     非 200 码一律归 `SERVER`（见 `accio-messages.ts`）。
+// 再加一条文案扫描腿只会引入过宽判据（把 400 参数错判成额度 → 白封账号一天），
+// 而这一家缺文案腿的代价是「上游用文案而非状态码表达额度」时不换号 —— 那是
+// **漏判**（少换一次号），方向与 minimax 那条「宁可漏判不可误伤」一致。
+//
+// ⚠️ **`EMPTY_RESPONSE` / `UNSUPPORTED_CONTENT` 等本地错误一律不换号**
+// （它们在换号判定之前就抛出了，根本到不了这里）。
+
+/** Accio 的失败类别（`auth` 只换号、绝不写冷却，见上文语义表）。 */
+export type AccioFailureClass = 'quota' | 'rate' | 'auth' | 'other'
+
+/**
+ * 失败类别 → 该不该**换号**（写不写冷却另由 {@link recordsAccioRateLimit} 判）。
+ *
+ * ⚠️ 必须把 `httpErrorCode` / `accioErrorFrame` 的**产出**喂进来，不得重扫状态码
+ * —— 同一仓库两套同义判据是本仓库首条红线（PR !62 的事故）。
+ */
+export function accioFailureClassOf(code: string): AccioFailureClass {
+  if (code === 'QUOTA_EXCEEDED') return 'quota'
+  if (code === 'RATE_LIMIT') return 'rate'
+  if (code === 'AUTH') return 'auth'
+  return 'other'
+}
+
+/**
+ * 该类别是否值得**换号重试**。
+ *
+ * ⚠️ `other` 为 false 的理由与 minimax / loomy 同款：400 参数错、5xx、
+ * 风控拦截页这些是**请求本身或环境**的问题，换号只会白烧整池。
+ */
+export function shouldRotateAccioAccount(code: string): boolean {
+  return accioFailureClassOf(code) !== 'other'
+}
+
+/**
+ * 该类别是否**写冷却标记**。
+ *
+ * ⚠️ **认证类恒 false**（见上文语义表的不变式）—— 这条是「一个请求封死整池」
+ * 与「坏账号永远轮不到」之间的取舍点，两家都选前者。
+ */
+export function recordsAccioRateLimit(code: string): boolean {
+  const cls = accioFailureClassOf(code)
+  return cls === 'quota' || cls === 'rate'
 }
 
 /** 从错误体里抠出可读 detail（**逐字保留服务端原文**，不吞）。 */
@@ -1031,8 +1128,15 @@ export class AccioAdapter extends LlmAdapter {
   private readonly product: AccioProduct
   private readonly fetchImpl: typeof fetch
   private readonly utdid: string
-  /** 远端目录缓存（成功拉取后永久保留）。 */
+  /** 远端目录缓存（成功拉取后保留 20 分钟）。 */
   private remoteModels: AccioFallbackModel[] | undefined
+  /**
+   * ⚠️ 上次**成功**读到远端目录的时刻（0 = 从未成功过）。
+   *
+   * ⚠️ 与 `remoteModels` **并存**、不是替代：`remoteModels` 存「有哪些模型」，
+   *    本字段存「何时读到的」。只有 `remoteModels` 时目录**永不刷新**（原行为）。
+   */
+  private catalogAt = 0
   /** 目录加载闸门：并发去重 + 失败/空结果冷却。 */
   private readonly catalogGate: RemoteCatalogGate
   /** 共享目录骨架（门控 → 读目录 → 黑名单 → 回填 → 三态）。 */
@@ -1052,6 +1156,17 @@ export class AccioAdapter extends LlmAdapter {
         product: this.product,
         loadCatalog: () => this.loadCatalogEntries(),
         syncCatalog: () => this.syncCatalogEntries(),
+        /**
+         * ★ **强制重拉**（供后台 20 分钟刷新器与「用户改设置」）。
+         *
+         * ⚠️ 与 `loadCatalog` 的差别：后者内部有 `isCatalogFresh` 判据 ⇒ 新鲜时**不拉**。
+         * 本回调要的是「无视新鲜度，强制拉一次」，故先清时刻再调同一个方法 ——
+         * **不另写一份拉取逻辑**（那会让两条路的上游行为分叉）。
+         */
+        refresh: async () => {
+          this.catalogAt = 0
+          await this.ensureRemoteModels()
+        },
         /**
          * ⚠️ **未知 id**（用户手填）：保守报 `['text']`。
          *
@@ -1079,14 +1194,30 @@ export class AccioAdapter extends LlmAdapter {
     return { id, name: this.product.displayName }
   }
 
-  /** 懒加载远端模型目录（仅拉取一次；失败/空结果走闸门冷却）。 */
+  /**
+   * 懒加载远端模型目录（**每 20 分钟**重新拉一次，用户 2026-10-18 的要求；
+   * 失败/空结果走闸门冷却）。
+   */
   private async ensureRemoteModels(): Promise<void> {
     const fetchRemote = this.options.fetchRemoteModels
-    if (this.remoteModels !== undefined || fetchRemote === undefined) return
+    // ⚠️ `fetchRemote === undefined` 那半边**原样保留** —— 它判的是「有没有远端
+    //    可拉」（无凭据/无接线），与新鲜度是两件事。
+    if (fetchRemote === undefined) return
+    // ⚠️ 判据来源：`isCatalogFresh`（`model-catalog.ts` 的**唯一**实现）。
+    // ⚠️ **入口用 `isCatalogFreshFor`**：用户在 Jet Hub 改开关后要**立即**重拉
+    //    （规格 §6 的正确性要求，见 `invalidateCatalogCache`）。gate 之后**不再**
+    //    判失效 —— 那里问的是「手上这份旧读数还能不能用」。
+    if (this.remoteModels !== undefined
+      && isCatalogFreshFor(this.product.id, this.catalogAt, this.options.now?.() ?? Date.now())) {
+      return
+    }
     await this.catalogGate.run(async () => {
       const models = await fetchRemote()
       if (models.length === 0) return false
       this.remoteModels = models
+      // ⚠️ **只在成功赋值后**记时刻：失败/空结果不写，否则一次抖动会把上界
+      //    刷新掉、下轮还要等满 20 分钟才发现上游没恢复。
+      this.catalogAt = this.options.now?.() ?? Date.now()
       return true
     })
   }
@@ -1190,6 +1321,21 @@ export class AccioAdapter extends LlmAdapter {
    * 会按黑名单过滤掉它们 ⇒ RPC 层只能凭裸 id 补回、展示名与倍率随之丢失
    * （用户报障：「关闭的就没有显示倍率」）。
    */
+  /**
+   * ★ **后台目录刷新器入口**（`src/index.ts` 的 `refreshOf` 调 `adapter.refresh?.()`）。
+   *
+   * ⚠️⚠️ 必须由适配器**显式转发** `catalog.refresh`：`ModelCatalog`（`model-catalog.ts`）
+   *    上的这个成员**不会**自动变成适配器的成员 —— `pruned()` 的 Proxy 只透传
+   *    **适配器自己的**成员（`dead-model-store.ts:748-749`）。
+   *    漏转发 ⇒ 刷新器「已武装」却对这家**空转**，且**零日志**（`refreshOf` 返回
+   *    `undefined` 时静默跳过 —— `index.ts` 的装配注释写着这件事）。
+   *    ⚠️ 与 `options.refresh`（HTTP 401 后的**凭据**重取）**不是同一件事**，
+   *    两者同名纯属巧合，**不得合并**。
+   */
+  async refresh(): Promise<void> {
+    await this.catalog.refresh?.()
+  }
+
   listAllModels(): readonly { id: string; name: string }[] {
     return this.catalog.listAllModels()
   }
@@ -1339,15 +1485,22 @@ export class AccioAdapter extends LlmAdapter {
     }
 
     // 3. 记录当前账号（Token 账本用；失败不影响请求）。
+    //
+    // ⚠️⚠️ **账号 id 必须是可变局部量，不是常量**（2026-10-18，issue IKM3ZV 修复）：
+    // 下面第 6 步的换号循环会换到另一个账号，而 `resolveCredential` 只在**首次**
+    // 调用（它返回「池当前会给出的那个」，换号后**不会跟着变**）⇒ 若继续用这里
+    // 的常量，冷却标记与账本都会**记到无辜账号头上**，而真正耗尽的号永不被标记
+    // ⇒ 下次请求又选中它（minimax / zcode 记过的同款事故）。
+    let currentAccountId = ''
     if (this.options.accountPool !== undefined) {
       try {
-        const accountId = await this.options.accountPool.findAccountIdByCredential(
+        currentAccountId = await this.options.accountPool.findAccountIdByCredential(
           this.product.id,
           credential.access_token,
         )
-        if (accountId !== '') reportLedgerAccount(this.product.id, accountId)
       } catch { /* 账号不匹配不影响请求 */ }
     }
+    if (currentAccountId !== '') reportLedgerAccount(this.product.id, currentAccountId)
 
     // 4. 会话命名的思考与预算决策（issue IKKVDH）。
     // ⚠️ Accio **关不掉思考**（实测四类字段全部无效，见文件头第 3 条）⇒
@@ -1419,37 +1572,220 @@ export class AccioAdapter extends LlmAdapter {
     else delete body.system_instruction
     if (options.stop !== undefined && options.stop.length > 0) body.stop_sequences = options.stop
 
-    // 6. 发送（401/403 时刷新一次凭据后重试一次）。
+    // 6. 发送 + **请求级账号轮换**（issue IKM3ZV）。
     //
-    // ⚠️⚠️ **重试前必须把新令牌写回 body**（真实缺陷，本轮修复）：
+    // ⚠️⚠️ **换号前必须把新令牌写回 body**（真实缺陷，2026-10-13 修）：
     // 令牌在 `body.token` 里，而 `send()` 只从 `credential` 取 `sgcookie` 头 ⇒
-    // 不更新 body 就是「刷新后重发旧 token」，该分支**结构性失效**
+    // 不更新 body 就是「刷新/换号后重发旧 token」，该分支**结构性失效**
     // （且 `AUTH` 不在 harness 的可重试集合里，兜不住）。
     // 用 {@link applyAccessToken} 与初次构造走**同一条**落点，避免第二处写法漂移。
+    //
+    // ## 两层重试，各司其职（issue 的核心诉求）
+    //
+    // | 层 | 触发 | 上界 | 谁负责 |
+    // |---|---|---|---|
+    // | **账号级** | 401/402/403/429 | 可用账号数（`tried` 保证） | 本循环 |
+    // | harness 级 | 其余可重试码 | 5 次 / 约 15.5s | DSH `DEFAULT_RETRYABLE_CODES` |
+    //
+    // 修复前只有第二层，而 402 被刻意归 `QUOTA_EXCEEDED`（**不**在 harness 的
+    // 可重试集合里）⇒ 确定性失败被原样冒泡成整轮失败。
+    //
+    // ⚠️ **401/403 的「刷新一次再重发」保留在最前面**：本家凭据可能被服务端
+    // 提前撤销而本地 `expiresAt` 仍在未来，续期救得回来的号不该被当成坏号轮换掉。
+    // 续期仍失败才落到换号（与 loomy / raccoon / minimax 的顺序一致）。
     applyAccessToken(body, credential.access_token)
-    let response = await this.send(credential, body, options)
-    if (!response.ok && (response.status === 401 || response.status === 403)) {
-      await this.options.refresh()
+    /** 已试过的账号 id；换号时传给池做排除（见 `AccountPool.getAvailableAccount`）。 */
+    const tried = new Set<string>()
+    if (currentAccountId !== '') tried.add(currentAccountId)
+
+    /**
+     * 给**当前**账号记冷却（额度至 UTC+8 当日 24:00 / 限流 1h；认证类绝不记）。
+     *
+     * ⚠️ 必须在**每次失败后立刻调用**（含第一次、也在轮换预算用尽之前），不能挪到
+     * 循环开头：那样最后一个失败账号永远等不到下一次迭代，就此漏记（minimax 记过：
+     * 8 账号全耗尽时只记 7/8，末号漏记 ⇒ 下次请求又选中它）。
+     */
+    const markCurrentAccount = async (failureCode: string): Promise<void> => {
+      if (this.options.accountPool === undefined) return
+      if (currentAccountId === '' || !recordsAccioRateLimit(failureCode)) return
+      /**
+       * ⚠️⚠️ **记账失败绝不能中断换号**（对抗审计 P2-1，2026-10-18 实证）。
+       *
+       * 池的写盘失败（磁盘满 / 权限）会抛裸 `Error`；若不隔离，它会冒到
+       * `rotate()` 之前 ⇒ **整个轮换流程被掐断** ⇒ 一次写盘失败就退化成
+       * 「零换号」—— 正是本 issue 要修的那个症状。
+       *
+       * ⇒ 两道纪律：① `try/catch` 隔离；② **即便记账失败也照常换号**
+       *   （记账是「锦上添花」，换号是「本轮能不能成」）。
+       */
+      try {
+        await this.options.accountPool.updateModelRateLimit(
+          currentAccountId,
+          options.model,
+          accioFailureClassOf(failureCode) === 'quota'
+            ? nextUtc8DayStartMs()
+            : Date.now() + ACCIO_RATE_LIMIT_COOLDOWN_MS,
+        )
+      } catch {
+        // ⚠️ 记账失败**如实留日志**（静默吞掉会让「号没被标记」变成不可排查的
+        // 现象 —— 本仓库记过多次同款）。拿不到 logger 时用 console.warn 兜底。
+        const detail = `accio: 写入限流标记失败（账号 ${currentAccountId} / 模型 ${options.model}）`
+        if (typeof console !== 'undefined') console.warn(detail)
+      }
+    }
+
+    /** 发一次；HTTP 401/403 时续期当前账号并重发一次。 */
+    const sendOnce = async (): Promise<Response> => {
+      // ⚠️ `credential!` 的非空断言是**必需**的：TS 不把上面 `if (credential === undefined) throw`
+      // 的收窄带进闭包（`credential` 是 `let`，闭包捕获的是可变量）。
+      // ⚠️ 断言**安全**的原因是可判定的：进入本闭包之前已抛错退出 ⇒ 此处恒非空。
+      const sent = await this.send(credential!, body, options)
+      if (sent.ok || (sent.status !== 401 && sent.status !== 403)) return sent
+      // ⚠️⚠️ 续期后**必须重新反查账号 id**（minimax `51ded6a` / loomy 同款）：
+      // 续期走的是**池内第一个可用账号**（见 `src/index.ts` 的 accio `refresh`），
+      // 二者可能不是同一个号 ⇒ 续期后取回的凭据属于另一个账号，而
+      // `currentAccountId` 还停在旧号上，冷却标记会**记到无辜账号头上**
+      // （没耗尽的被封、真该封的下次仍被选中）。
+      /**
+       * ⚠️ **续期抛错降级为「没有新凭据」**（对抗审计 P2-1）：`refresh()` 失败时
+       * 裸 `Error` 会冒泡、丢掉 `AUTH` 语义。⇒ 返回 `sent`（原响应），
+       * 由调用方按原始错误（401/403）如实处理。
+       */
+      try {
+        await this.options.refresh()
+      } catch (error) {
+        console.warn(`accio: 续期失败（不阻断本轮）：${errorMessage(error)}`)
+        return sent
+      }
       const refreshed = await this.options.resolveCredential(options.model)
-      if (refreshed === undefined || refreshed.access_token === '') {
-        throw new LlmError('accio: credential expired and refresh failed', 'AUTH', {
-          status: response.status,
-        })
+      if (refreshed === undefined || refreshed.access_token === '') return sent
+      /**
+       * ⚠️⚠️ **反查必须先于 `credential` 赋值**（对抗审计 P1-2，2026-10-18 实证）。
+       *
+       * 旧顺序（`credential = refreshed` 在前、反查在后且 `catch {}` 静默）会造出
+       * 三处状态错位，**全部可复现**：
+       *   ① `credential` 已是新号、`currentAccountId` 却停在旧号 ⇒ 后续冷却
+       *      **记到无辜账号头上**，而真正失败的号永不被标记；
+       *   ② `tried` 没加新号 ⇒ `rotate()` 可能把它取回来 ⇒ **同一 token 重发**；
+       *   ③ 「已发出请求的账号」与「被记账的账号」不一致 ⇒ 用户看到「登录了
+       *      2 个号却只有 1 个可用」。
+       *
+       * ⚠️ **可达性不是假设**：`findAccountIdByCredential` 在账号被停用、或
+       * `access_token` 因并发续期已轮换（`accio-auth.ts` 记着「每次都会轮换」）
+       * 时都会返回 `''` ⇒ 走的正是这条分支。
+       */
+      let nextAccountId = currentAccountId
+      let reverseLookupOk = false
+      if (this.options.accountPool !== undefined) {
+        try {
+          const resolved = await this.options.accountPool.findAccountIdByCredential(
+            this.product.id, refreshed.access_token,
+          )
+          if (resolved !== '') {
+            nextAccountId = resolved
+            reverseLookupOk = true
+          }
+        } catch { /* 反查失败不阻断主路径：见下面的降级处置 */ }
+      } else {
+        reverseLookupOk = true   // 无池 ⇒ 没有账号 id 这条腿，视为「无需更新」
+      }
+      if (reverseLookupOk && nextAccountId !== currentAccountId) {
+        /**
+         * ⚠️⚠️ **只「加」新账号，绝不「删」旧账号**（对抗审计复核时发现的真缺陷）。
+         *
+         * 旧写法是 `tried.delete(currentAccountId); tried.add(nextAccountId)`
+         * —— `delete` 的意图是「让池能重新取到新账号」，但它**把旧账号从已试集里
+         * 摘掉了** ⇒ 旧账号（acc-1，那个刚回 401 的）**重新变成可取回候选**
+         * ⇒ 后续 `rotate()` 会把它再取回来 ⇒ **同一个 token 重发**。
+         *
+         * ⚠️ 实测（`accio-account-rotation.spec.ts` 的「续期后的账号反查」那条）
+         * token 序列从 `[A, B, C]` 退化成 `[A, B, A, C]` —— `A` 被发两次。
+         *
+         * ⇒ 正确处置：`tried` 是「**本轮已试过的账号**」，只会**单调增长**。
+         * 换到新账号时**加**它即可；旧账号必须**留在**集里（它确实试过、且失败了）。
+         */
+        tried.add(nextAccountId)
+        currentAccountId = nextAccountId
+        reportLedgerAccount(this.product.id, currentAccountId)
+      } else if (!reverseLookupOk) {
+        /**
+         * ⚠️⚠️ **反查失败 ⇒ 整段放弃这次续期重发**（对抗审计 P1-2 的正解）。
+         *
+         * 此刻我们知道 `refreshed` 属于**某个**账号，但**不知道是哪个**。
+         * 若照样换上它发出去，就会造出「**发请求的账号**」与「**被记账的账号**」
+         * 分裂 —— 后果有两条，都实测过：
+         *   ① 后续冷却记到**无辜账号**头上，真凶漏记；
+         *   ② 该账号不在 `tried` 里 ⇒ `rotate()` 会把它取回来 ⇒ **同一 token 重发**
+         *      （新增守卫实测序列 `['TOK-A','TOK-B','TOK-B']`）。
+         *
+         * ⇒ 正确处置是**不重发**：把原响应（401/403）退回给调用方，由它按
+         * **账号级错误**走「记账 + 换号」—— 那条路径的 `currentAccountId` 是
+         * **可判定的**（就是 `currentAccountId` 本身）。宁可这次换号慢一拍，
+         * 也不要用一个「不知道属于谁」的凭据发请求。
+         */
+        return sent
       }
       credential = refreshed
-      // ⚠️ 只覆盖令牌：`message_id` / `request_id` / `properties` 必须保持原值
-      //（同一次逻辑请求，重建 body 会换掉请求身份）。
+      applyAccessToken(body, refreshed.access_token)
+      return await this.send(credential, body, options)
+    }
+
+    /**
+     * 取下一个账号并重发；成功则返回新响应，不可换号或没有下一个则返回 `undefined`。
+     *
+     * ⚠️ **必须传真实 modelId 且传 `tried`**：
+     * - 传空串会让限流过滤整体短路（`if (modelId.length === 0) return true`），
+     *   刚标记的账号立刻又被选中 —— 换号形同虚设（trae 记过的用户报障）；
+     * - 不传 `tried` 会在 A/B 之间反复空转（qoder 踩过，见
+     *   `qoder-adapter.ts` 的 `switchAccountOnQuota` 注释）。
+     */
+    const rotate = async (): Promise<Response | undefined> => {
+      if (this.options.accountPool === undefined) return undefined
+      /**
+       * ⚠️ **取号失败（池抛错）降级为「无可换账号」而非冒泡**（对抗审计 P2-1）。
+       *
+       * 池读盘失败时抛的是裸 `Error`（不在 harness 的可重试码里）⇒ 直接冒泡会让
+       * 用户看到 `POOL BOOM` 这种内部串，且**丢掉 `QUOTA_EXCEEDED` 语义**
+       * （额度耗尽被伪装成内部错误）。
+       * ⇒ 降级成「换不到号」⇒ 由调用方按**原始错误**如实抛出。
+       */
+      let next: { entry: { id: string; credentialRef: string }; credential: AccioCredential } | null
+      try {
+        next = await this.options.accountPool.getAvailableAccount<AccioCredential>(
+          this.product.id, options.model, tried,
+        )
+      } catch (error) {
+        console.warn(`accio: 从账号池取下一个账号失败：${errorMessage(error)}`)
+        return undefined
+      }
+      if (next === null || next === undefined || tried.has(next.entry.id)) return undefined
+      tried.add(next.entry.id)
+      /**
+       * ⚠️ 池里的凭据是**裸 `JSON.parse`**（`AccountPool.getAvailableAccount`
+       * 不做形状校验），手工编辑过的备份 / 损坏条目可能是 `{}`。
+       * ⇒ 判空后**继续换下一个**而不是放弃整池（minimax 的同款修复：
+       * 写成 `next.credential.access_token.length` 会抛 `TypeError`（非 `LlmError`）
+       * 且用 `break` ⇒ 一个坏号把整个轮换掐断）。
+       */
+      if (typeof next.credential?.access_token !== 'string'
+        || next.credential.access_token === '') return await rotate()
+      credential = next.credential
+      currentAccountId = next.entry.id
+      reportLedgerAccount(this.product.id, currentAccountId)
       applyAccessToken(body, credential.access_token)
-      response = await this.send(credential, body, options)
+      return await this.send(credential, body, options)
     }
-    if (!response.ok) {
-      const text = await response.text().catch(() => '')
-      // ⚠️ 402 / 额度不足 ⇒ `QUOTA_EXCEEDED`（见 `httpErrorCode` 的说明）。
-      throw new LlmError(`accio: ${errorDetail(text)}`, httpErrorCode(response.status), {
-        status: response.status,
-      })
-    }
-    if (response.body === null) {
+
+    let response = await sendOnce()
+
+    /**
+     * ⚠️ **空 body 早抛，且刻意只在 `response.ok` 时判**。
+     *
+     * 非 2xx 的响应 body 可能是 `null`（HEAD / 204 / 某些 4xx）—— 那不是
+     * 「空响应」而是「错误响应」，必须让下面的段①按状态码分类，**否则一个
+     * 402 会被误报成 `EMPTY_RESPONSE`、丢掉额度语义**（`other` 类不换号）。
+     */
+    if (response.ok && response.body === null) {
       throw new LlmError('accio: empty model response body', 'EMPTY_RESPONSE')
     }
     /**
@@ -1477,33 +1813,128 @@ export class AccioAdapter extends LlmAdapter {
      *
      * ⚠️ 归类 `SERVER`（**不重试**）：风控是**身份/环境**问题，原样重发只会
      * 再被拦（与 `trae-adapter.ts` 的 4006 不重试同理）。
+     *
+     * ⚠️ **刻意抽成函数**：换号后取回的响应也要走同一格（换号后拿到风控页
+     * 完全可能），而流内换号与 HTTP 换号是同一个循环里的两段 —— 判据必须
+     * 只有一份，否则两段会漂移（这是「同一语义两套判据」的本仓库首条红线）。
      */
-    const contentType = response.headers.get('content-type') ?? ''
-    if (!contentType.includes('text/event-stream')) {
+    const assertEventStream = async (target: Response): Promise<void> => {
+      const contentType = target.headers.get('content-type') ?? ''
+      if (contentType.includes('text/event-stream')) return
       // ⚠️ 读 body 只为**把服务端原文带给用户/日志**（诊断用），失败不影响判据。
-      const peek = await response.text().catch(() => '')
+      const peek = await target.text().catch(() => '')
       throw new LlmError(
         `accio: 上游未返回事件流（content-type: ${contentType || '(空)'}）——`
         + `通常是被风控拦截（网关返回 200 + HTML 拦截页）。`
         + `${peek === '' ? '' : ` 服务端原文：${peek.slice(0, 200)}`}`,
         'SERVER',
-        { status: response.status },
+        { status: target.status },
       )
     }
+    // ⚠️ **刻意不在这里先 `await assertEventStream(response)`**：
+    // 首次响应可能压根不是 2xx（`!ok`），而 `assertEventStream` 会把任何
+    // 非 SSE 响应判成「风控拦截页」（`SERVER`）⇒ 402/400 的真实分类被覆盖。
+    // 它只在下面循环的 ② 格（**已确认 2xx 之后**）被调用。
 
-    // 7. 消费 SSE。
+    // 7. 消费 SSE —— **含流内账号级错误的换号**（issue IKM3ZV）。
     //
-    // ⚠️ **流内 402 由 `consumeAccioSse` 抛 `QUOTA_EXCEEDED`**（HTTP 仍是 200）。
-    //    这里**绝不 catch-and-rewrap** —— 重包会丢掉额度语义、把它降级成
-    //    「模型没返回内容」（Task 3 修过的真实缺陷）。
+    // ⚠️ **流内 402 由 `consumeAccioSse` 抛 `QUOTA_EXCEEDED`**（HTTP 仍是 200），
+    // 而这恰恰是本家**最常见的额度失败形态**（上游把 402 包在 SSE 帧里回，
+    // 实测 `{"turn_complete":true,"error_code":"402","error_message":"unauthorized"}`）。
+    // ⚠️ **绝不 catch-and-rewrap** —— 重包会丢掉额度语义、把它降级成
+    // 「模型没返回内容」（Task 3 修过的真实缺陷）。
     //
-    // ⚠️ 工具调用分片先经 `accioToolCallMergeTransform` 合并（见该函数的说明）。
-    const merged = response.body.pipeThrough(accioToolCallMergeTransform())
-    yield* consumeAccioSse({
-      body: merged,
-      ...options.signal === undefined ? {} : { signal: options.signal },
-      idleTimeoutMs: ACCIO_SSE_IDLE_TIMEOUT_MS,
-    })
+    // ⚠️ **只有「尚未产出任何 chunk」才允许换号重发**：换号会**重放整次请求**，
+    // 而新的 `consumeAccioSse` 是**全新生成器** ⇒ 已产出正文后再换号，用户会
+    // 看到两份内容被拼在一起（比不换号更糟），且工具会被执行两次
+    // （lobsterai 记过同款事故：`https://example.invalid` 真实被点了两次）。
+    const consumeOnce = async function* (
+      target: Response,
+    ): AsyncGenerator<StreamChunk, void, undefined> {
+      const body = target.body
+      if (body === null) throw new LlmError('accio: empty model response body', 'EMPTY_RESPONSE')
+      // ⚠️ 工具调用分片先经 `accioToolCallMergeTransform` 合并（见该函数的说明）。
+      const merged = body.pipeThrough(accioToolCallMergeTransform())
+      yield* consumeAccioSse({
+        body: merged,
+        ...options.signal === undefined ? {} : { signal: options.signal },
+        idleTimeoutMs: ACCIO_SSE_IDLE_TIMEOUT_MS,
+      })
+    }
+
+    /**
+     * ⚠️⚠️ **一个循环，两段**（这是本实现最关键的结构决定，2026-10-18）。
+     *
+     * 初版写成「HTTP 层换号循环 + 流内换号循环」两个独立 `for` ⇒ 实测三条
+     * 用例被打穿（全部有牙）：
+     *
+     * | 症状 | 根因 |
+     * |---|---|
+     * | 流内 402 换号后取回的账号**在 HTTP 层就失败** ⇒ 报「模型未返回任何内容块」 | 流内循环把 `!ok` 的响应直接塞回 `consumeOnce`，它于是去读一个 402 的 JSON 体当 SSE |
+     * | 已产出内容后遇流内 402 ⇒ **连冷却都不记** | 同上：内容在错误分类前就被绕过了 |
+     * | 坏凭据被跳过后**整池不再换号** | 两个循环各自计数，预算被重复消耗 |
+     *
+     * ⇒ 合并后 HTTP 失败与流内失败走**同一条**「记账 + 换号」路径，
+     * `round` 也只有**一个**预算。两条通道的差异只剩「错误码从哪来」。
+     */
+    let producedAny = false
+    for (let round = 0; ; round++) {
+      // ── ① HTTP 层 ──
+      if (!response.ok) {
+        const text = await response.text().catch(() => '')
+        const code = httpErrorCode(response.status)
+        // ⚠️ 非账号级 ⇒ 原样抛（不再往下走流内格）。
+        if (!shouldRotateAccioAccount(code)) {
+          throw new LlmError(`accio: ${errorDetail(text)}`, code, { status: response.status })
+        }
+        // ⚠️ **必须在 `rotate()` 之前无条件记账**（不只是预算用尽那一格）：
+        // 挪到换号之后 ⇒ 换号成功时当前账号**永不被标记** ⇒ 下次请求又选中它
+        // （「卡死在一个号上」的残余形态）。
+        await markCurrentAccount(code)
+        if (round >= ACCIO_MAX_ROTATE - 1) {
+          throw new LlmError(`accio: ${errorDetail(text)}`, code, { status: response.status })
+        }
+        const rotated = await rotate()
+        if (rotated === undefined) {
+          throw new LlmError(`accio: ${errorDetail(text)}`, code, { status: response.status })
+        }
+        response = rotated
+        // ⚠️ **必须 `continue` 回顶部重新判 HTTP 层**：换到的账号可能又在
+        // HTTP 层失败（这是实测打穿的那一格）。
+        continue
+      }
+      if (response.body === null) {
+        throw new LlmError('accio: empty model response body', 'EMPTY_RESPONSE')
+      }
+      // ── ② content-type + 流内 ──
+      try {
+        await assertEventStream(response)
+        for await (const chunk of consumeOnce(response)) {
+          producedAny = true
+          yield chunk
+        }
+        return
+      } catch (error) {
+        const code = error instanceof LlmError ? error.code : ''
+        // ⚠️ 三条早退，缺一不可：
+        // ① **已产出内容** ⇒ 换号会重放请求、拼正文、重复执行工具 ⇒ 如实抛；
+        // ② **用户取消**（`aborted` 但 `reason` 不一定带语义）⇒ 不换号；
+        // ③ **非账号级错误**（参数错 / 5xx / 风控）⇒ 换号无益、白烧整池。
+        if (producedAny) {
+          // ⚠️ **已产出内容后仍必须记账**（否则这个已明确失败的账号永不被冷却，
+          // 下次请求又选中它 —— 「卡死在一个号上」的残余形态）。
+          if (!options.signal?.aborted && code !== '') await markCurrentAccount(code)
+          throw error
+        }
+        if (options.signal?.aborted === true) throw error
+        if (!shouldRotateAccioAccount(code)) throw error
+        await markCurrentAccount(code)
+        if (round >= ACCIO_MAX_ROTATE - 1) throw error
+        const rotated = await rotate()
+        if (rotated === undefined) throw error
+        response = rotated
+      }
+    }
   }
 
   /** 发起一次推理请求；网络失败映射为可重试的 `TRANSPORT`。 */

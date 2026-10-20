@@ -19,7 +19,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import { credentialRef, type CredentialRef } from '@deepseek-ai/dsh-credentials'
 import { openIncognitoWindow } from './login.js'
-import { AccountPool } from './account-pool.js'
+import { AccountPool, asProxyText } from './account-pool.js'
 import { AUTO_PROVIDER as AUTO_PROVIDER_ID } from './auto-adapter.js'
 import { resolveAutoBadgeRewrite, type AutoBadgeState } from './auto-badge.js'
 import { broadcastCatalogChanged } from './catalog-broadcast.js'
@@ -48,6 +48,37 @@ import { buddyExpiringWindowDays } from './buddy-balance-rank.js'
 //    ⚠️ 每一次调用都**重新读**这个导出（而不是在模块级拷成另一个常量），以后者为准会
 //    在接入新渠道时静默漂移：一键按钮会开始清掉**已接入**渠道的白名单。
 import { WIRED_EXPIRY_PROVIDERS } from './aggregate-expiry.js'
+// ⚠️ **值导入**：`AGGREGATE_PROVIDER` 是聚合的 provider id（写入端点在下面三处要用它
+//    作为 `invalidateCatalogCache` 的键）。**不**在本文件再抄一份字面量 `'aggregate'`
+//    —— 那会与常量漂移（本文件另一处 `modelAdapters?.['aggregate']` 是既有写法，
+//    本次只新增消费点，不改既有行）。
+//    ⚠️ 依赖方向：`aggregate-adapter.ts` 不 import 本文件 ⇒ 无环。
+// ⚠️ `invalidateCatalogCache`：用户主动改设置 ⇒ 该 provider 的目录读数**立即**失效
+//    （规格 §6 的正确性要求，不是优化）。实现在 `model-catalog.ts`（与
+//    `isCatalogFresh` 同一处，保证「多久算新鲜」只有一份判据）。
+//
+// ⚠️⚠️⚠️ **接线规则（2026-10-19 复审补齐，务必照此逐条自查）**
+//
+//   「凡是写入**目录或门控相关表**的端点，**成功之后**都要
+//     `invalidateCatalogCache(req.provider)`」
+//     （聚合那几处写的是 `invalidateCatalogCache(AGGREGATE_PROVIDER)` —— 只失效
+//     聚合**自己**一个 provider，绝不顺手失效其余渠道，那是「改一个开关打十几个
+//     上游」）。
+//
+//   这条规则**必须成对**满足两个条件才算接线正确：
+//   ① 端点**真的写**了下面这些表之一：模型黑名单（`disabledModels`）、失效表
+//      （dead models）、聚合拒绝表、聚合白名单、聚合手工顺序表、聚合排序模式；
+//   ② 调用点在**写盘成功之后**（参数校验 `return`、写入抛错、目录核实不过而拒绝的
+//      路径一个字都没改，失效只会白打一次上游）。
+//
+//   ⚠️⚠️ **`provider.setEnabled` 曾被漏掉过一次**（真实的漏网教训，2026-10-19 复审
+//   发现）：它是 Jet Hub 里**最显眼**的供应商级开关（左栏每行尾的那个），写的
+//   正是**同一张模型黑名单**（`clearDisabledModels` / `setModelsDisabled`），
+//   症状与单条 `model.setDisabled` 逐字相同 —— 而它当时没接线。
+//   ⇒ 只按「已核实的行号清单」接线必然漏；**必须按上面那条规则**逐个端点自查。
+//   接线清单与理由见 `src/model-catalog.ts` 的 `invalidateCatalogCache` 注释。
+import { AGGREGATE_PROVIDER } from './aggregate-adapter.js'
+import { invalidateCatalogCache } from './model-catalog.js'
 import type { LoomyAuth } from './loomy-auth.js'
 import type { LoomyCredential } from './loomy.js'
 import { RACCOON } from './raccoon-product.js'
@@ -82,6 +113,23 @@ import { parseAutoclawCredential, isAutoclawRefreshable, autoclawDisplayNickname
 import type { ModelscopeAuth } from './modelscope-auth.js'
 import { normalizeAccioRegion, type StartedAccioLogin } from './accio-auth.js'
 import { ACCIO } from './accio-product.js'
+// AStudio（讯飞 AstronStudio）：直连上游 MAAS。**没有 OAuth 授权页** —— 凭据是客户端登录后
+// **明文落盘**会话的拷贝（见 `astudio-auth.ts` 模块头），故 `account.create` 走
+// `importLocalSession`（导入即完成，没有可用的 loginUrl，见该分支的 `reused`）。
+// ⚠️ 本家符号**分属两个模块**：`astudioAccountNickname` 在 `astudio-auth.ts`，
+//    `isAstudioRefreshable` 与凭据类型在 `astudio.ts`（产品常量在 `astudio-product.ts`）。
+import { ASTUDIO } from './astudio-product.js'
+import { astudioAccountNickname, type AstudioAuth } from './astudio-auth.js'
+import { isAstudioRefreshable, type AstudioCredential } from './astudio.js'
+import { loginNeedsExternalAction } from './login-failure.js'
+import {
+  createAstudioWechatQrCode,
+  pollAstudioWechatScan,
+  bindAstudioWechatSession,
+  startAstudioLoginFlow,
+  type AstudioWechatQrCode,
+  type StartedAstudioLoginFlow,
+} from './astudio-oauth.js'
 // ⚠️ **本 fork 独有**（modelscope，2026-10-16）。
 import { MODELSCOPE } from './modelscope-product.js'
 import { maskModelscopeKey } from './modelscope.js'
@@ -208,6 +256,8 @@ import { pickTestModel,
 } from './account-probe.js'
 import { exportBackup, importBackup } from './backup.js'
 import { handleOpencodeRpc } from './opencode-rpc.js'
+import { geminiFetchForAccount } from './gemini-proxy.js'
+import { handleGeminiRpc } from './gemini-rpc.js'
 import { handleModelscopeRpc } from './modelscope-rpc.js'
 import { clearDeadModels, deadModelIdsFor } from './dead-model-store.js'
 import { OPENCODE } from './opencode-product.js'
@@ -745,6 +795,34 @@ export interface CreditsEndpointDeps<
      */
     roundDeadlineAt: number | undefined,
   ) => Promise<RpcBuddyGrowthAccountResult | undefined>
+  /**
+   * 签到收尾的**附加提示**（可选；对 `claimed` 与 `already-claimed` **都会跑**）。
+   *
+   * ## 为什么需要它（2026-10-20 用户报障，真机截图）
+   *
+   * TRAE 的「1024 打卡抽奖」应该在**点签到按钮**时触发。第一版把抽奖挂在
+   * `claimTraeDailyCheckin` 内部 ⇒ **几乎永不触发**：本家 `precheckStatus: true`，
+   * `credits.claimAll` 会先查状态，今天已签到就直接回 `already-claimed`、
+   * **根本不调 `claim`**（见上面 `precheck` 那段）。而「已签到」恰恰是最该抽奖的
+   * 时机（签到后才解锁抽奖）⇒ 用户实测 4 个账号全显示「今天已签到」、
+   * 一条抽奖信息都没有。
+   *
+   * ## 契约
+   *
+   * - 返回**字符串** ⇒ 追加到该账号的 `outcome.message`（客户端已经渲染这一行）；
+   * - 返回 `undefined` ⇒ 什么都不加（**不该抽的情形必须回 undefined**，
+   *   报「今天本来就不该抽」只会制造噪声）；
+   * - **永不抛**：抽奖是不可逆写操作且会因「今日已参与 / 窗口外 / 无资格」失败，
+   *   那些都**不是**签到失败（本仓库有两轮「登录成功却因记账失败被报成失败」事故史）。
+   *
+   * ⚠️ 只有 trae 注入；其余 provider 不传 ⇒ 行为逐字不变。
+   */
+  afterClaimNote?: (
+    credential: TCredential,
+    product: TProduct,
+    entry: ProviderAccountEntry,
+    outcome: ClaimOutcome,
+  ) => Promise<string | undefined>
   /** 查询积分余额；默认使用真实的 fetchCreditBalance。 */
   fetchBalance?: (credential: TCredential, product: TProduct) => Promise<CreditBalance | null>
   /**
@@ -759,6 +837,7 @@ export interface CreditsEndpointDeps<
   fetchBalanceDetailed?: (
     credential: TCredential,
     product: TProduct,
+    accountId?: string,
   ) => Promise<{ balance: CreditBalance | null; error?: string; extra?: RpcCreditsBalanceExtra }>
   /**
    * 整轮（全部账号）的时间预算（毫秒）。缺省 30 分钟。
@@ -883,7 +962,10 @@ export async function collectCreditsStatus<TCredential = BuddyCredential, TProdu
   for (const entry of accounts) {
     let status: CheckinStatus | null = null
     try {
-      const resolved = await deps.resolve(credentialRef(entry.credentialRef))
+      let resolved = await deps.resolve(credentialRef(entry.credentialRef))
+      if (resolved === undefined && (product as { id?: string }).id === ASTUDIO.id) {
+        resolved = await deps.resolve(credentialRef(ASTUDIO.defaultCredentialRef))
+      }
       if (resolved !== undefined) {
         const credential = JSON.parse(resolved.value) as TCredential
         status = await fetchStatus(credential, product)
@@ -985,6 +1067,34 @@ export async function collectClaimResults<TCredential = BuddyCredential, TProduc
     }
     outcomes.push(outcome)
     results.push({ accountId: entry.id, nickname: entry.nickname, outcome })
+    // ★ **签到收尾的附加提示**（2026-10-20）：本条对 `claimed` 与 `already-claimed`
+    //   **都会跑** —— 后者正是「今天已签到」的账号（本家 precheck 直接回它、
+    //   连 `claim` 都不调），而它恰恰最该抽奖。见 `afterClaimNote` 的契约说明。
+    //   ⚠️ 必须在 `results.push` **之后**改写（改的是同一对象引用）——
+    //      放到之前也行，但那时 `outcome` 还没定稿，语义容易读错。
+    if (deps.afterClaimNote !== undefined) {
+      try {
+        const resolvedForNote = await deps.resolve(credentialRef(entry.credentialRef))
+        if (resolvedForNote !== undefined) {
+          const credentialForNote = JSON.parse(resolvedForNote.value) as TCredential
+          const note = await deps.afterClaimNote(
+            credentialForNote, product, entry, outcome,
+          )
+          if (typeof note === 'string' && note.length > 0) {
+            // ⚠️ 只改**这一条** outcome 的 message（客户端渲染的就是它）。
+            //    `claimed` 结局原本没有 message 字段 ⇒ 这里补上；
+            //    `already-claimed` / `inactive` / `failed` 则是追加在原文案之后。
+            const target = results[results.length - 1]!.outcome as { message?: string }
+            target.message = typeof target.message === 'string' && target.message.length > 0
+              ? `${target.message} · ${note}`
+              : note
+          }
+        }
+      } catch (error) {
+        // ⚠️ 抽奖的任何异常都不得影响签到结果（契约见 `afterClaimNote`）。
+        deps.warn?.(`[jet-hub] credits.claimAll 账号 ${entry.id} 收尾提示失败: ${String(error)}`)
+      }
+    }
     // 成长中心等「领取之后」的下钻：与签到共用这一趟循环，避免把凭据解析做两遍。
     // 它的异常只让该项自己失败，不影响已定稿的签到 outcome。
     if (deps.afterClaim !== undefined) {
@@ -1071,14 +1181,19 @@ export async function collectCreditBalances<TCredential = BuddyCredential, TProd
     }
     if (balance === null) {
       try {
-        const resolved = await deps.resolve(credentialRef(entry.credentialRef))
+        let resolved = await deps.resolve(credentialRef(entry.credentialRef))
+        if (resolved === undefined && (product as { id?: string }).id === ASTUDIO.id) {
+          resolved = await deps.resolve(credentialRef(ASTUDIO.defaultCredentialRef))
+        }
         if (resolved === undefined) {
           error = '凭据未配置'
         } else {
           const credential = JSON.parse(resolved.value) as TCredential
           if (fetchDetailed !== undefined) {
             // 带原因的查询：实现自己决定「非积分账户」等业务状态的文案。
-            const detailed = await fetchDetailed(credential, product)
+            // ⚠️ `entry.id` 必须透传（Gitee issue IKLTZ2）：Gemini 要按**账号**
+            // 取出口代理，而账号 id 无法由 `credentialRef` 反查。
+            const detailed = await fetchDetailed(credential, product, entry.id)
             balance = detailed.balance
             error = detailed.error
             extra = detailed.extra
@@ -1292,7 +1407,16 @@ export interface JetHubAuths {
    */
   readonly officeace: OfficeAceAuth
   readonly accio: AccioAuth
-readonly autoclaw: AutoclawAuth
+  /**
+   * AStudio（讯飞 AstronStudio，2026-10-16）。
+   *
+   * ⚠️ 与其余各家**不同**：本家没有 `startLogin`、不开回调服务器、没有
+   * `authorizeUrl`。`account.create` 用 `importLocalSession(refName)` 把**本机 AStudio
+   * 客户端已登录的会话**（磁盘明文 `modelBearerToken`，fact 399/402）读进 DSH 凭据库
+   * —— 一次做完的同步路径 ⇒ 返回体靠 `reused: true` 走前端的成功出口。
+   */
+  readonly astudio: AstudioAuth
+  readonly autoclaw: AutoclawAuth
   /**
    * ModelScope（魔搭）—— **本 fork 独有**（上游 rc.11 仍无此 provider）。
    *
@@ -1425,6 +1549,27 @@ export interface ModelCatalogSource {
    */
   describeCatalogHealth?(): CatalogHealth
   /**
+   * 「**目录是否已可用于批量写操作**」的本地探测（**可选** —— 目前只有聚合适配器实现它）。
+   *
+   * ## ⚠️⚠️ 为什么需要它（Critical：Task 7 的目录非阻塞把 IKJW33 缺陷重新打开了）
+   *
+   * `fullCatalogIds` 的判据是「**远端读到即可**」（`remoteError` 为空 ⇒ 认为成功）。
+   * 对**其余 19 家**，目录是**固定 / 编译期兜底表 + 远端覆盖**，「读到」与「读全」
+   * 基本等价。而聚合的目录是**逐渠道动态推导**的，且 Task 7 之后它的 `listModels`
+   * **不再同步等上游** ⇒ 冷启动时它**立刻**返回 `['auto']` ⇒ 远端那一半「读成功」
+   * 但只含 1 条 ⇒ 用户点「关闭聚合供应商」只关掉 `auto`，
+   * `provider.setEnabled` 却返回 `ok:true` / `changedCount:1`，另外两个虚拟模型
+   * **仍然可选**（`provider.status` 则把这帧错判成 `closed:true`）。
+   *
+   * ⇒ 有实现时，**两个端点都先问它**；`ready === false` 时按「目录不完整」处理
+   *（`setEnabled` 拒绝、`status` 报安全方向 `closed:false`）。
+   *
+   * ⚠️ 必须**同步且零 IO**：`provider.status` 在设置页挂载时对每个供应商都调，
+   *    一旦它触发网络请求会拖慢首屏（本接口其它成员的同一约束）。
+   * ⚠️ 抛错会被调用点吞掉（按「不可用」处理，即安全方向），故实现方可以放心报。
+   */
+  catalogReadyForBulkWrite?(): { ready: boolean; reason?: string }
+  /**
    * 清空**临期折算缓存**（**可选** —— 只有聚合适配器实现它）。
    *
    * ## ⚠️⚠️ 为什么领取（claim）之后必须调它（真实缺陷，对抗审计实测证伪，2026-10-07）
@@ -1529,7 +1674,8 @@ export interface ModelCatalogSource {
  * | 调用点 | 需求 | 对「远端那一半缺失」的动作 |
  * |---|---|---|
  * | `model.setAllDisabled` | **必须完整**（要写黑名单） | 判 `complete`：**拒绝且不落盘** |
- * | `provider.setEnabled` | **远端读成功即可**（要写黑名单） | 判 `remoteError`：读失败**拒绝**；读到但为空**照常关闭** |
+ * | `provider.setEnabled` | **远端读成功即可**（要写黑名单） | 判 `remoteError`：读失败**拒绝**；读到但为空**照常关闭**；**适配器自报未就绪（`notReady`）拒绝** |
+ * | `provider.status` | 只要「能否证明已关闭」 | `remoteError` 或 `notReady` ⇒ **保守报未关闭**（安全方向） |
  * | `account.test` | **尽力而为**（只要一个 id 就能测） | 用拿到的那些照常测 |
  *
  * ⚠️ `provider.setEnabled` 刻意**不**与 `model.setAllDisabled` 同判据：
@@ -1573,8 +1719,29 @@ interface FullCatalogResult {
    * ⚠️ 为 `undefined` 而 `complete === false` ⇒ 就是上面第 2 种形态
    *（远端读到但为空）。`provider.setEnabled` 据此决定「照常关闭」，
    * 提示层据此放弃核对。
+   * ⚠️ **它不承载第 3 种形态**（适配器自报「目录尚未就绪」）—— 那一种见
+   * {@link notReady}，因为两者的**用户动作不同**（那个要等 / 重试，这个要登录）。
    */
   remoteError?: string
+  /**
+   * **适配器自报「目录尚未就绪」**（只有实现 `catalogReadyForBulkWrite` 的适配器
+   * 会给出值，目前只有聚合）。
+   *
+   * ## ⚠️⚠️ 这是第 3 种「目录不完整」形态，**判据与处置都与前两种不同**
+   *
+   * | 形态 | `remoteError` | `notReady` | `provider.setEnabled` 的动作 |
+   * |---|---|---|---|
+   * | 远端读失败（超时/抛错） | 有值 | 无 | **拒绝**（既有守卫） |
+   * | 远端读到但为空（无账号门控） | 无 | 无 | **照常关闭**（既有取舍，否则无账号供应商永远关不掉） |
+   * | **适配器说「我这份目录还不是全的」** | 无 | **有值** | **拒绝**（本字段引入的原因） |
+   *
+   * 为什么第 3 种**不能**塞进 `remoteError`：那个字段的语义是「远端**读失败**」，
+   * 而这里远端**读成功了**（`listModels` 正常返回了 `['auto']`）—— 把它记成读失败
+   * 会让排障者去查网络，而真相是「聚合目录的逐渠道推导还没跑完」。
+   * 为什么**不能**塞进 `complete === false`：那会让它落进第 2 种形态的「照常关闭」，
+   * 正是本次要修的缺陷（只关掉 `auto` 却返回成功）。
+   */
+  notReady?: string
 }
 
 /**
@@ -1654,6 +1821,41 @@ async function fullCatalogIds(
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error)
     return { ids: adapterIds, complete: false, remoteError: `读取模型列表失败：${reason}` }
+  }
+
+  // ⚠️⚠️ **第 3 种形态：适配器自报「我这份目录还不是全的」**（Critcal，Task 7 引入）。
+  //
+  // 上面那一步「远端读到」对**动态目录**的 provider（目前只有聚合）**不再等价于
+  // 读全**：Task 7 之后聚合的 `listModels` 立刻返回**已知**目录（冷启动时只有
+  // `auto`），逐渠道推导转后台 ⇒ 这里会看到「读成功、但只有 1 条」。
+  //
+  // 不拦的后果（控制方实测）：
+  // ```
+  // setEnabled(false) 结果 = {"written":["auto"],"changedCount":1}   ← 只关了 auto！
+  // 稳态对照       = {"written":["auto","deepseek-v4-1-flash","glm-5-3"],"changedCount":3}
+  // ```
+  // 用户点「关闭聚合供应商」→ 提示「已关闭 1 个模型」、返回 `ok:true`，而另外两个
+  // 虚拟模型**仍可选** —— 正是本文件 `provider.setEnabled` 注释里明文禁止的缺陷形态。
+  //
+  // ⚠️ **必须排在「远端读到但为空」那一步之前**判：冷帧下聚合的远端也会是
+  // `['auto']`（非空）⇒ 不加这一步会一路落到下面「成功」分支。
+  // ⚠️ 探测**抛错按「不可用」处理**（保守方向：宁可拒绝一次关闭，也不要写出残缺
+  // 黑名单后仍报成功）。
+  try {
+    const readiness = modelAdapters?.[provider]?.catalogReadyForBulkWrite?.()
+    if (readiness !== undefined && readiness.ready !== true) {
+      return {
+        ids: [...new Set([...adapterIds, ...remoteIds])],
+        complete: false,
+        notReady: readiness.reason ?? '目录尚未就绪',
+      }
+    }
+  } catch {
+    return {
+      ids: [...new Set([...adapterIds, ...remoteIds])],
+      complete: false,
+      notReady: '目录就绪状态探测失败',
+    }
   }
 
   // ⚠️⚠️ **远端读到但为空 ⇒ 同样不可用于写黑名单**（`complete: false`，且**无**
@@ -1797,7 +1999,10 @@ async function readableCatalogIds(
 ): Promise<ReadonlySet<string> | undefined> {
   const catalog = await fullCatalogIds(ctx, modelAdapters, provider)
   // ⚠️⚠️ **目录不可用 ⇒ 整体放弃核对**（判 `complete`，它同时覆盖
-  // 「远端读失败」与「远端读到但为空」两种形态 —— 见该字段的长注释）。
+  // 「远端读失败」「远端读到但为空」「**适配器自报未就绪**（`notReady`）」三种形态
+  // —— 见该字段的长注释）。第三种是 Task 7 引入的（聚合的 `listModels` 不再同步
+  // 等上游 ⇒ 冷帧只有 `auto`）：那时并集是残缺的，拿它核对会**大面积误报**
+  // 「该模型可能已被上游下架」。
   // 不得退化成「只用 listAllModels 兜底表」：那会退回第一版的大面积误报。
   // 提示层错了不如不说。
   if (!catalog.complete) return undefined
@@ -1867,6 +2072,7 @@ trae, cline, loomy, raccoon, minimax,
     // ⚠️ `minimaxintl` 的变量名与键同名（没有驼峰差异），故直接简写解构。
     minimaxintl,
     zcode, gemini, accio, autoclaw,
+    astudio,
   } = auths
   /**
    * 积分能力表。
@@ -1895,6 +2101,10 @@ trae, cline, loomy, raccoon, minimax,
     //    直接读池、照常生效 ⇒ 症状只出现在积分，极难对应。
     //    惰性读（用户随时可能改设置），不能固化成字符串。
     minimaxXff: () => pool.minimaxXff(),
+    // ⚠️ Gemini 的按账号 fetcher（Gitee issue IKLTZ2）：`credits.balances`
+    // 是**用户点一下就等**的主路径，配了账号代理却不接 ⇒ 积分行恒报
+    // 「配额查询网络失败」，而推理路径却正常 —— 症状割裂、极难对应。
+    geminiFetchFor: (accountId) => geminiFetchForAccount(accountId),
   })
   /**
    * **一次性奖励**能力表（Loomy 新手任务 / raccoon 登录奖励）。
@@ -2050,7 +2260,20 @@ trae, cline, loomy, raccoon, minimax,
     // 池内 `expiresAt` 确实会被写 ⇒ 不属 loomy / zcode 那类豁免。
     // 漏登记的后果是「凭据明明能续，面板却报未登录」（2026-10-12 复审发现）。
     ACCIO.id,
-AUTOCLAW.id,
+    // ⚠️ astudio（讯飞 AstronStudio，2026-10-16）**有**可用的续期链，故不属于
+    // loomy / zcode 那类「设计上没有 refresh 端点」的显式豁免：
+    // · 触发点唯一 = 上游 MAAS 返回 **HTTP 401**（fact 401：客户端的
+    //   `refreshAstronSessionCredentialAfterUnauthorized` 也仅挂这一点）；流内
+    //   1002/1005 与 502 model_not_found / no_valid_authorization **不得**挂自愈，
+    //   否则对确定性失败白刷。
+    // · `AstudioAuth.refreshAccountCredential` 内部幂等重跑纯读端点
+    //   `GET /xingchen-studio/bot/models/configs`（api_key 不轮换，fact 399），
+    //   只重取一次、并发去重，且**绝不回写**客户端的 astron-session.json。
+    // · 会话真失效 = HTTP 200 + code=80000 ⇒ 走 `AstudioRefreshTokenExpiredError`
+    //   一次性终态「需人工重新登录」，不进重试循环。
+    // 漏登记的后果与 accio 同款：凭据其实只需一次重取，面板却永报「未登录」。
+    ASTUDIO.id,
+    AUTOCLAW.id,
     // ⚠️ **本 fork 独有**（modelscope，2026-10-17 改判）**仍刻意不在本表里**：
     //    ⚠️ 原注释写「它是 `balance: false`（魔搭没有额度 API）⇒ 积分端点压根不会
     //    为它走这条链」——**那条已被证伪**：魔搭**有**魔粒余额端点
@@ -2499,6 +2722,19 @@ AUTOCLAW.id,
     Promise<{ done: boolean; success?: boolean; error?: string }>
   >()
 
+  interface PendingAstudioScanState {
+    fd: string
+    credentialRef: string
+  }
+
+  const pendingAstudioScanState = new Map<string, PendingAstudioScanState>()
+  const pendingAstudioFlowState = new Map<string, StartedAstudioLoginFlow>()
+
+  const astudioExchangeInFlight = new Map<
+    string,
+    Promise<{ done: boolean; success?: boolean; error?: string }>
+  >()
+
   /**
    * 登录**终态失败**记录（账号 id → `{ message, at }`；`message` 即下发给前端的原文）。
    *
@@ -2568,7 +2804,21 @@ AUTOCLAW.id,
    * 用户会看到「第一次说 A、再点一次说 B」。
    */
   function loginFailureMessage(reason: unknown): string {
-    return `登录失败：${loginReasonText(reason)}。请重新点击「+ 新建账号」。`
+    const text = loginReasonText(reason)
+    // ⚠️⚠️ **「请重新点击「+ 新建账号」」只在重试可能有意义时才加**（2026-10-20 用户报障）。
+    //
+    // 有一类失败的**出路在外部**：OfficeAce「尚未开通 ModelArts MaaS」⇒ 去**果办客户端**
+    // 点开通并同意授权；AStudio 会话失效 ⇒ 去 **AStudio 桌面端**重新微信扫码。
+    // 那些情形重新点「+ 新建账号」只会重走一遍授权、然后**再失败一次** ⇒ 那半句是
+    // **假出路**：它把用户锚在一个永远不会成功的动作上，还把内层那句唯一有用的指路
+    // 冲淡了（与 `docs/agent-notes/client-ui.md` 的 IKLBSH 同向：文案本身就是出路）。
+    //
+    // ⚠️ 判据是**抛错方打的标记**（`src/login-failure.ts`），**不是**匹配文案 ——
+    //    后者一改就失效，且属本仓库明令的「一文件两套同义判据」形态。
+    // ⚠️ fail-closed 方向：**未标记一律照旧加后缀** —— 误留后缀只是不精确，
+    //    误删后缀会让用户不知道该做什么。
+    if (loginNeedsExternalAction(reason)) return `登录失败：${text}`
+    return `登录失败：${text}。请重新点击「+ 新建账号」。`
   }
 
   /**
@@ -2685,6 +2935,8 @@ AUTOCLAW.id,
     //（正常路径同值；改造期存量数据可能只有其一）。
     const pending = pendingOfficeAceState.get(accountId)
     if (pending !== undefined) refs.add(pending.credentialRef)
+    const pendingAstudio = pendingAstudioScanState.get(accountId)
+    if (pendingAstudio !== undefined) refs.add(pendingAstudio.credentialRef)
     let readFailed = false
     for (const name of refs) {
       if (name.length === 0) continue
@@ -2759,6 +3011,11 @@ AUTOCLAW.id,
       return recordLoginFailure(accountId, new Error('该账号条目已被删除（可能是你手动删掉了它）'))
     }
     const message = recordLoginFailure(accountId, error)
+    const pendingFlow = pendingAstudioFlowState.get(accountId)
+    if (pendingFlow !== undefined) {
+      pendingAstudioFlowState.delete(accountId)
+      void pendingFlow.close().catch(() => {})
+    }
     void pool.removeAccount(accountId).catch(() => {})
     return message
   }
@@ -3108,6 +3365,67 @@ AUTOCLAW.id,
   }
 
   /**
+   * 执行一次 AStudio 微信扫码登录轮询与凭据交换。
+   */
+  async function exchangeAstudioScanLogin(
+    accountId: string,
+    entry: { credentialRef: string },
+    pending: PendingAstudioScanState,
+  ): Promise<{ done: boolean; success?: boolean; error?: string }> {
+    const scanResult = await pollAstudioWechatScan(pending.fd, {
+      fetcher: auths.astudio.fetchImpl,
+    }).catch(() => ({ status: 'pending' as const }))
+    if (scanResult.status === 'pending') {
+      return { done: false }
+    }
+
+    if (scanResult.status === 'unbound' || scanResult.status === 'error') {
+      const msg = scanResult.message || '微信扫码登录已失效或失败，请重新发起登录'
+      const failure = await failLogin(accountId, new Error(msg))
+      pendingAstudioScanState.delete(accountId)
+      return { done: true, success: false, error: failure ?? msg }
+    }
+
+    if (scanResult.status === 'scanned') {
+      const bound = await bindAstudioWechatSession(pending.fd, scanResult.account, {
+        fetcher: auths.astudio.fetchImpl,
+      })
+        .then(() => true)
+        .catch(() => false)
+      if (!bound) {
+        ctx.logger.warn(`[jet-hub] AStudio wechat session bind returned non-ok for ${accountId}`)
+      }
+
+      let credential: AstudioCredential
+      try {
+        credential = await auths.astudio.completeLogin(
+          scanResult.account,
+          pending.credentialRef ?? entry.credentialRef,
+        )
+      } catch (error) {
+        const failure = await failLogin(accountId, error)
+        pendingAstudioScanState.delete(accountId)
+        if (failure === undefined) return { done: true, success: true }
+        return { done: true, success: false, error: failure }
+      }
+
+      pendingAstudioScanState.delete(accountId)
+      try {
+        await pool.updateAccount(accountId, {
+          nickname: astudioAccountNickname(credential, accountId),
+          expiresAt: undefined,
+          refreshable: isAstudioRefreshable(credential),
+        })
+      } catch (error) {
+        ctx.logger.warn(`[jet-hub] astudio 回填账号条目失败：${String(error)}`)
+      }
+      return { done: true, success: true }
+    }
+
+    return { done: false }
+  }
+
+  /**
    * 用量徽标的显示偏好（`$DSH_HOME/jet-hub/ui-preferences.json`）。
    *
    * ⚠️ 与账号池**分开**的独立文档：`state.json` 是整体替换语义，同机另一条工作区
@@ -3419,6 +3737,12 @@ AUTOCLAW.id,
   async function handleMethod(method: string, payload: unknown, _signal?: AbortSignal): Promise<unknown> {
     if (method.startsWith('opencode.')) {
       const handled = await handleOpencodeRpc(ctx, pool, method, payload)
+      if (handled !== undefined) return handled
+    }
+    // ⚠️ Gitee issue IKLTZ2：`gemini.*` 走**同样的前缀改道**（理由见上面
+    // opencode 那一段：Jet Hub 只有一条 RPC 通道，主 switch 的 `default` 不让路）。
+    if (method.startsWith('gemini.')) {
+      const handled = await handleGeminiRpc(ctx, pool, method, payload)
       if (handled !== undefined) return handled
     }
     // ⚠️ **本 fork 独有**（modelscope，2026-10-17 审计 P0 修复）：魔搭与 opencode
@@ -4033,7 +4357,48 @@ AUTOCLAW.id,
            * ⚠️ 先登记**占位条目**（无凭据），使前端 `login.poll` 能立即看到
            * 该账号；登录成功后再回填昵称与 `expiresAt`。失败则删除占位条目，
            * 不留幽灵账号（照 MINIMAX.id 分支的已验证形态）。
+           *
+           * ⚠️⚠️ **必须带上客户端传来的代理**（IKLTZ2 审计 P2-1，真实死锁）：
+           * 换 token 那一次请求（下一步）发生在凭据落盘**之前**，此时**只有这条
+           * 占位条目**认得这个账号 ⇒ 代理只能从这里读。不带 ⇒ 墙外环境下
+           * **登录恒失败**，而用户**没法给一个还不存在的账号配代理**（面板的
+           * 「代理」按钮按 `accountId` 打开）⇒ 只能导出 `HTTPS_PROXY` 绕过。
+           * 触发路径很常见：refresh_token 失效的既定动作就是「删号重登」，
+           * 而重登造的是**全新 id** ⇒ 旧号上的代理配置必然丢失。
+           *
+           * ⚠️ 走 `setGeminiProxy` 而不是直接塞字段：那里有「空串删键」与
+           * 形状校验的既有口径，直接塞会绕过它们。
+           * ⚠️ `raw.trim()` 是**防御**（载荷无 schema 校验，见 `accioRegion`
+           * 的同款注释）；不传时 `req.geminiProxy` 是 `undefined` ⇒ 直连。
            */
+          // ⚠️ 走 `setGeminiProxy`（而不是直接往 addAccount 塞字段）：那里有
+          // 「空串删键 + 最新快照合并」的既有口径，直接塞会绕过它们。
+          //
+          // ⚠️⚠️ **代理来源有两级**（IKLTZ2 审计 P2-1 的死锁修复）：
+          // ① 载荷显式带（将来 UI 提供输入时用）；
+          // ② **从同 provider 的已有账号继承** —— 这是当前的实际生效路径，
+          //    因为「refresh_token 失效 ⇒ 删号重登」是面板明示的既定动作
+          //    （见 `plugin-src/client/jet-hub.js`），而重登造的是**全新 id**
+          //    ⇒ 旧号上的代理必然丢失 ⇒ 换 token 那一步恒直连 ⇒ 墙外环境下
+          //    **登录恒失败**；用户又**没法给还不存在的账号配代理**（面板的
+          //    「代理」按钮按 `accountId` 打开）⇒ 死锁。
+          //    继承只在**恰好一个账号带代理**时生效（多账号时无法判断该继承
+          //    哪个，宁可直连也不要猜错出口把凭据发到错误的代理上）。
+          //
+          // ⚠️ `typeof` 与 `trim()` 是**防御**：载荷无 schema 校验
+          // （同 `accioRegion` 的注释）。
+          const existingGeminiProxies = new Set(
+            (await pool.listAccountsByProvider(GEMINI.id))
+              .map((e) => asProxyText(e.geminiProxy))
+              .filter((p) => p.trim() !== ''),
+          )
+          const requestedGeminiProxy = typeof req.geminiProxy === 'string' ? req.geminiProxy.trim() : ''
+          const inheritedGeminiProxy = existingGeminiProxies.size === 1
+            ? [...existingGeminiProxies][0]!
+            : ''
+          const geminiProxyInput = requestedGeminiProxy !== ''
+            ? requestedGeminiProxy
+            : inheritedGeminiProxy
           await pool.addAccount({
             id,
             provider: GEMINI.id,
@@ -4043,10 +4408,15 @@ AUTOCLAW.id,
             refreshable: false,
             createdAt: Date.now(),
           })
+          if (geminiProxyInput !== '') await pool.setGeminiProxy(id, geminiProxyInput)
 
           let geminiStarted: StartedGeminiLoginFlow
           try {
-            geminiStarted = await gemini.startLogin()
+            // ⚠️ **必须传 `accountId`**（Gitee issue IKLTZ2）：换 token 那一次
+            // 请求发生在凭据落盘**之前**，此时只有池里的占位条目认得这个账号 ——
+            // 不传就拿不到它的代理 ⇒ 墙外环境下**登录恒失败**，症状与
+            // 「client_secret / redirect_uri 配错」同形，极易误判。
+            geminiStarted = await gemini.startLogin({ accountId: id })
           } catch (error) {
             // 回调端口占用/网络失败：删掉占位条目，不留幽灵账号。
             void pool.removeAccount(id).catch(() => {})
@@ -4265,6 +4635,108 @@ AUTOCLAW.id,
           })
 
           return { ok: true, value: { accountId: id, loginUrl: accioStarted.loginUrl } }
+        } else if (provider === ASTUDIO.id) {
+          /**
+           * AStudio（讯飞 AstronStudio）**没有 OAuth 授权页**：推理凭据是**本机客户端
+           * 已登录会话的明文拷贝**（磁盘 `astron-session.json` 的 `modelBearerToken`，
+           * fact 399/402；服务端 `Set-Cookie Max-Age=31536000`，bundle 内**不存在任何
+           * 程序化续期接口**）⇒ 没有「授权页 + 回调」这一步可返回 URL。
+           *
+           * ⚠️⚠️ 与其余各家一致、与**上面的 Accio 分支相反**：本分支**必须自己**
+           * `pool.addAccount` 登记条目、失败时**必须自己** `pool.removeAccount` 清掉。
+           * Accio 那段「刻意不调 addAccount」成立的前提是 `AccioAuth.startLogin`
+           * 内部自己登记占位条目；而 `AstudioAuth` **没有** `startLogin` ⇒ 照抄 Accio
+           * 会一个账号都建不出来（gemini L3195-3203 / officeace L3256-3264 是范式）。
+           *
+           * ⚠️ 返回值靠 `reused: true` + 空 `loginUrl` 命中前端的成功出口
+           *（`jet-hub.js` 的 `if (res.reused)`：接受空 loginUrl、直接 loadAccounts）。
+           * `RpcCreateAccountResponse.loginUrl` 是**必填 string**，故空串是唯一能同时满足
+           * 类型契约与「不弹窗」的做法；代价是提示文案对本家略失真（写「复用已有账号」
+           * 而实际是「导入本机会话」）—— 已知偏离，本轮刻意不改 types.ts / jet-hub.js
+           * 以缩小热点面。新增的 `loginMode: 'url'` 缺省行为不受影响。
+           */
+          await pool.addAccount({
+            id,
+            provider: ASTUDIO.id,
+            nickname: id,
+            enabled: true,
+            credentialRef: refName,
+            refreshable: false,
+            createdAt: Date.now(),
+          })
+
+          const reqAstudio = req as { astudioLoginMethod?: string }
+          const loginMethod = reqAstudio.astudioLoginMethod
+
+          if (loginMethod !== 'web') {
+            let imported: AstudioCredential | undefined
+            try {
+              imported = await astudio.importLocalSession(refName)
+            } catch (error) {
+              if (loginMethod === 'local') {
+                void pool.removeAccount(id).catch(() => {})
+                const reason = error instanceof Error ? error.message : String(error)
+                throw new Error(`导入本机 AStudio 会话失败：${reason}`)
+              }
+              imported = undefined
+            }
+
+            if (imported !== undefined) {
+              await pool.updateAccount(id, {
+                nickname: astudioAccountNickname(imported, id),
+                expiresAt: undefined,
+                refreshable: isAstudioRefreshable(imported),
+              })
+              return { ok: true, value: { accountId: id, loginUrl: '', reused: true } }
+            }
+          }
+
+          // 本地无会话或选择网页登录：启动 AStudio Carrier 载体页服务（三合一：手机短信/账号密码/微信扫码）
+          let astudioStarted: StartedAstudioLoginFlow
+          try {
+            astudioStarted = await startAstudioLoginFlow({
+              product: ASTUDIO,
+              fetcher: astudio.fetchImpl,
+            })
+          } catch (error) {
+            void pool.removeAccount(id).catch(() => {})
+            const reason = error instanceof Error ? error.message : String(error)
+            throw new Error(`无法启动 AStudio 网页登录（本地 Carrier Server 启动失败）：${reason}`)
+          }
+
+          pendingAstudioFlowState.set(id, astudioStarted)
+
+          astudioStarted.result
+            .then(async (credential) => {
+              pendingAstudioFlowState.delete(id)
+              try {
+                await astudio.persistLogin(credential, { refName })
+              } catch (error) {
+                const failure = await failLogin(id, error instanceof Error ? error : new Error(String(error)))
+                if (failure !== undefined) {
+                  ctx.logger.warn(`[jet-hub] astudio 凭据回填写入凭据库失败已清理占位账号：${failure}`)
+                }
+                return
+              }
+              try {
+                await pool.updateAccount(id, {
+                  nickname: astudioAccountNickname(credential, id),
+                  expiresAt: undefined,
+                  refreshable: isAstudioRefreshable(credential),
+                })
+              } catch (error) {
+                ctx.logger.warn(`[jet-hub] astudio 回填账号条目失败：${String(error)}`)
+              }
+            })
+            .catch(async (error) => {
+              pendingAstudioFlowState.delete(id)
+              const failure = await failLogin(id, error)
+              if (failure !== undefined) {
+                ctx.logger.warn(`[jet-hub] astudio 本地 Carrier 登录流程异常终止：${failure}`)
+              }
+            })
+
+          return { ok: true, value: { accountId: id, loginUrl: astudioStarted.loginUrl } }
         } else {
           return { ok: false, error: { code: 'bad-request', message: `unknown provider: ${provider}` } }
         }
@@ -4278,6 +4750,11 @@ AUTOCLAW.id,
 
       case 'account.delete': {
         const req = payload as RpcDeleteAccountRequest
+        const pendingFlow = pendingAstudioFlowState.get(req.accountId)
+        if (pendingFlow !== undefined) {
+          pendingAstudioFlowState.delete(req.accountId)
+          void pendingFlow.close().catch(() => {})
+        }
         await pool.removeAccount(req.accountId)
         return { ok: true, value: undefined }
       }
@@ -4489,6 +4966,23 @@ AUTOCLAW.id,
                   // 这里仍要兜住，否则一次未捕获拒绝会连带跳过后面那行 `delete`。
                 }
                 officeAceExchangeInFlight.delete(req.accountId)
+              })()
+              return { ok: true, value: await task }
+            }
+          }
+          if (entry.provider === ASTUDIO.id) {
+            const pending = pendingAstudioScanState.get(req.accountId)
+            if (pending !== undefined) {
+              const shared = astudioExchangeInFlight.get(req.accountId)
+              if (shared !== undefined) return { ok: true, value: await shared }
+              const task = exchangeAstudioScanLogin(req.accountId, entry, pending)
+              astudioExchangeInFlight.set(req.accountId, task)
+              void (async () => {
+                try {
+                  await task
+                } catch {
+                }
+                astudioExchangeInFlight.delete(req.accountId)
               })()
               return { ok: true, value: await task }
             }
@@ -5121,6 +5615,19 @@ AUTOCLAW.id,
           claim: (credential, _product, entry) => impl.claim!(credential, entry, callContext),
           // ⚠️ 由能力表驱动，不再散落 provider 字面量。
           ...impl.precheckStatus === undefined ? {} : { precheckStatus: impl.precheckStatus },
+          // ★ 签到收尾的附加提示（TRAE 的 1024 打卡抽奖走这里）。
+          //   ⚠️ **必须透传**：漏了它症状是「抽奖永远不触发」且**日志零字**
+          //   —— 与 `afterClaim` 漏接线同型（那格已复发过一次）。
+          ...impl.afterClaimNote === undefined
+            ? {}
+            : {
+                afterClaimNote: (credential: unknown, _product: unknown, entry: unknown) =>
+                  impl.afterClaimNote!(
+                    credential,
+                    entry as never,
+                    undefined as never,
+                  ),
+              },
           // ⚠️ 预检优先用 `claimStatus`，缺席时回落到 `fetchStatus`
           //（buddy / minimax 的预检与面板读数是同一个端点，只声明一次）。
           ...(impl.claimStatus ?? impl.fetchStatus) === undefined
@@ -5441,13 +5948,19 @@ AUTOCLAW.id,
         }
         // ⚠️ 包一层适配：runtime 的签名是 `(credential, call)`，
         //    `collectCreditBalances` 的入参签名是 `(credential, product)`。
+        // ⚠️ `accountId` 经**逐账号**包装传入（Gitee issue IKLTZ2）：Gemini 要按
+        //    账号取出口代理，故 `callContext` 必须是**每账号一份**而不是端点级
+        //    单例 —— 共享单例会让所有账号都查到「最后一个」账号的代理。
         const values = await collectCreditBalances(accounts, undefined, {
           resolve: (ref) => ctx.credentials.resolve(ref),
           ...impl.fetchBalanceDetailed === undefined
             ? {}
             : {
-                fetchBalanceDetailed: (credential) =>
-                  impl.fetchBalanceDetailed!(credential, callContext),
+                fetchBalanceDetailed: (credential, _product, accountId) =>
+                  impl.fetchBalanceDetailed!(
+                    credential,
+                    accountId === undefined ? callContext : { ...callContext, accountId },
+                  ),
               },
           ...impl.fetchBalance === undefined
             ? {}
@@ -5835,6 +6348,13 @@ AUTOCLAW.id,
         )
         // 必须广播：否则开关只写进磁盘、界面一直显示旧目录（成因见该函数注释）。
         broadcastCatalogChanged(ctx)
+        // ⚠️⚠️ 用户主动改目录相关的设置 ⇒ 该 provider 的目录读数**立即**失效，
+        // 否则要等满 20 分钟才看到效果（规格 §6 的正确性要求，不是优化）。
+        // ⚠️ 必须排在**写入之后**：失败路径（参数校验 `return`、或上面写入抛错）
+        // 一个字都没改，此时失效只会白打一次上游。
+        // ⚠️ `model.setDisabledMany`（按分组批量开关）**也已接线** —— 它是同一类
+        // 写入端点（同一张黑名单），不接线的症状与单条开关逐字相同。
+        invalidateCatalogCache(req.provider)
         const disabledModels = pool.listDisabledModels(req.provider)
         // ⚠️⚠️ **静默空操作必须留痕**（Issue IKJW33）：对已从上游目录消失的 id
         // 开关时，旧实现返回「成功」却什么都没发生、且零警告。写入语义不变，
@@ -5882,6 +6402,9 @@ AUTOCLAW.id,
         // 必须广播：与三个开关端点同约定，否则客户端目录（`llm/adapters-updated`
         // 三个触发源之一）不复位，用户点了「重新显示」界面却不动。
         broadcastCatalogChanged(ctx)
+        // ⚠️ 用户主动改了目录相关的设置 ⇒ 该 provider 的目录读数**立即**失效
+        //（规格 §6 的正确性要求，见 `invalidateCatalogCache`）。排在写入之后。
+        invalidateCatalogCache(req.provider)
         ctx.logger.info(
           `[jet-hub] 恢复 ${removed} 个失效模型：${req.provider}`
           + `${req.modelId === undefined ? '' : `/${req.modelId}`}`,
@@ -5932,6 +6455,11 @@ AUTOCLAW.id,
         )
         // 与其它开关端点一致：必须广播，否则界面一直显示旧目录。
         broadcastCatalogChanged(ctx)
+        // ⚠️ **本处是 brief 那 6 处之外的同一类写入端点**（第 7 处）：
+        //    它写的是同一张黑名单（只是按分组批量），用户点「本组全关」之后
+        //    同样会撞上「最坏等满 20 分钟」—— 不接线的症状与单条开关**逐字相同**。
+        //    刻意补上（brief 的 6 处是“已核实到行”的清单，不是“只许这 6 处”）。
+        invalidateCatalogCache(req.provider)
         const disabledModels = pool.listDisabledModels(req.provider)
         // 与单条端点同约定：目录外的 id 必须留痕（Issue IKJW33）。
         const warnings = catalogWarnings(known, req.provider, ids, req.disabled)
@@ -6050,6 +6578,13 @@ AUTOCLAW.id,
         }
         // 只广播一次：批量不等于逐条广播。
         broadcastCatalogChanged(ctx)
+        // ⚠️ 用户主动改了目录相关的设置 ⇒ 该 provider 的目录读数**立即**失效
+        //（规格 §6 的正确性要求，见 `invalidateCatalogCache`）。
+        // ⚠️ 排在**所有失败 `return` 之后**：上面四条拒绝分支一个字都没写，
+        // 那时失效只会白打一次上游。
+        // ⚠️ 命中「本就已全部关闭」的幂等短路时也照样失效一次 —— 那是用户点了一个
+        // 开关、期望看到最新的代价（一次上游目录读取），比「界面纹丝不动」划算。
+        invalidateCatalogCache(req.provider)
         const value: RpcModelSetAllDisabledResponse = {
           provider: req.provider,
           disabledModels: pool.listDisabledModels(req.provider),
@@ -6136,7 +6671,26 @@ AUTOCLAW.id,
             // 此时并集只剩适配器兜底表，`disabled` 会按它算 —— 因为
             // `closed` 的判据是「子集里全部命中」，若兜底表全命中就仍报已关闭。
             // 这是可接受的：兜底表全关 + 远端看不到 ⇒ 用户确实没有可选模型。
-            if (full.remoteError === undefined) {
+            if (full.notReady !== undefined) {
+              // ⚠️⚠️ **适配器自报「目录还没读全」⇒ 报安全方向**（Critical）。
+              //
+              // 与 `provider.setEnabled` 同一个根因（`fullCatalogIds` 的第 3 种形态），
+              // 但**用户后果不同**：那边是「只关掉一部分却报成功」，这边是
+              // 「只关掉 `auto`，整个『聚合』在设置页被标成**已关闭**」。
+              // 控制方实测（Task 7 之后）：
+              // ```
+              // provider.status = {"total":1,"disabled":1,"closed":true,"verified":"ok（远端 0 条）"}
+              // 改前形态        = {"total":1,"disabled":1,"closed":false,"verified":"remoteError：超时"}
+              // ```
+              // 改前该路径必然 2000ms 超时 ⇒ `remoteError` ⇒ `closed=false`（**安全方向**）；
+              // 改后核实「成功」但只见到 `auto` ⇒ `closed=true`（**危险方向**），
+              // 而另外两个虚拟模型仍可选 —— 界面与事实相反。
+              //
+              // ⇒ 这里把 `notReady` 与「核实不了（远端读失败）」**并列**处理：
+              // 两者都说明「我这份合并目录不足以证明已关闭」，都报 `closed:false`。
+              // 报 false 是安全的（用户可再点一次开关，点了会得到上面那条明确拒绝）。
+              closed = false
+            } else if (full.remoteError === undefined) {
               total = full.ids.length
               disabled = full.ids.filter((id) => disabledMap[id] === true).length
               closed = total > 0 && disabled === total
@@ -6249,6 +6803,33 @@ AUTOCLAW.id,
               },
             }
           }
+          // ⚠️⚠️ **第 3 种形态：适配器自报「目录还没读全」⇒ 必须拒绝**（Critical）。
+          //
+          // 判据是 `notReady`（**不是** `complete`、**不是** `remoteError`），理由与
+          // 三段判据的对应关系见 `FullCatalogResult.notReady` 的长注释。
+          //
+          // 这里修的缺陷（Task 7 重新打开，控制方实测）：
+          // ```
+          // setEnabled(false) 结果 = {"written":["auto"],"changedCount":1}   ← 只关了 auto！
+          // 稳态对照       = {"written":["auto","deepseek-v4-1-flash","glm-5-3"],"changedCount":3}
+          // ```
+          // 用户点「关闭聚合供应商」后界面提示「已关闭 1 个模型」并返回 `ok:true`，
+          // 而另外两个虚拟模型**仍可选** —— 该文件 `:6298` 的注释明文禁止这一形态。
+          //
+          // ⚠️ 与「无账号门控照常关闭」**不冲突**：那条针对的是**目录已读全、只是
+          // 里面没有模型**（`remoteIds` 为空但推导跑过了）；这里是「推导压根还没跑
+          // 完」⇒ 拒绝是唯一不撒谎的选择。用户等目录落地后再点一次即可，
+          // 文案如实说明这一点。
+          if (catalog.notReady !== undefined) {
+            return {
+              ok: false,
+              error: {
+                code: 'bad-request',
+                message: `聚合目录尚未读取完成（${catalog.notReady}），`
+                  + '为避免只关闭一部分模型，本次未做任何变更。请稍后重试。',
+              },
+            }
+          }
           // 远端读到（含为空）但并集为空 ⇒ 适配器目录里都没有该 provider 的
           // 模型，真没东西可关，拒绝且不落盘。文案与 `model.setAllDisabled`
           // 的「目录为空」形态逐字同构。
@@ -6279,6 +6860,17 @@ AUTOCLAW.id,
         // 账号状态**在模型之后**处理（顺序理由见上）。返回实际变更数，
         // 已是目标状态的账号不计入，避免提示夸大成「已停用 N 个」。
         const accountCount = await pool.setAccountsEnabled(req.provider, req.enabled)
+        // ⚠️⚠️ **第 8 处**（2026-10-19 复审补齐）：本端点写的是**同一张模型黑名单**
+        //   （关闭方向 `setModelsDisabled`、打开方向 `clearDisabledModels`），
+        //   症状与单条 `model.setDisabled` 逐字相同 —— 而它此前**漏接线**。
+        //   它是 Jet Hub 最显眼的供应商级开关，漏它的代价最大。
+        // ⚠️ **必须排在真正写盘成功之后**：上面关闭方向的四条拒绝分支
+        //   （`remoteError` / `notReady` / `ids.length === 0` / 参数校验）都**一个
+        //   字都没改**，此时失效只会白打一次上游；而那段 `fullCatalogIds` 远端核实
+        //   （Task 7 为「只关 auto 却返回成功」的 IKJW33 形态加的守卫）也**不**因
+        //   本行而改变行为 —— 失效只发生在成功路径、且只置陈旧不删内容。
+        // ⚠️ 放在 `setAccountsEnabled` 之后 ⇒ 连账号侧也一并生效。
+        invalidateCatalogCache(req.provider)
         // 两个方向都改变 listModels 的结果（关/开黑名单），**必须广播**，
         // 否则对话框的模型选择器要重启才更新（成因见 broadcastCatalogChanged）。
         broadcastCatalogChanged(ctx)
@@ -6366,6 +6958,31 @@ AUTOCLAW.id,
         // ⚠️ 清选型缓存：让改动**立刻**生效（虽然缓存键含拒绝表指纹、正确性不依赖
         //    它，但清掉可立即释放内存，并让语义更直白）。
         modelAdapters?.['aggregate']?.clearChoiceCache?.()
+        // ⚠️ **额外失效 `aggregate` 自己的目录缓存**（`catalogAt`）——
+        //
+        // ⚠️⚠️⚠️ **准确的因果（2026-10-19 复审订正 —— 原文那段是错的）**：
+        // 复审核实 `refreshCatalog` 的推导链是
+        //   `catalogs[provider] = await ctx.llm.listModels(provider)` ⇒
+        //   `buildVirtualModels(catalogs)`，
+        // 而 `buildVirtualModels`（`aggregate-catalog.ts`）**只读各渠道目录的
+        // `id` / `name` 与归一映射** ⇒ **完全不读拒绝表、白名单、顺序表、排序模式**。
+        //
+        // ⇒ 所以**这一处失效并不是为了让聚合目录重算**（改这三张表，当前实现下
+        //   推导结果逐字节相同）。它是为了**语义对齐 / 兜底**：保持
+        //   「凡是写入目录或门控相关表的端点都失效」这条规则不破例，万一将来
+        //   `buildVirtualModels` 真的开始依赖它们，这里**已经**是对的。
+        //
+        // ⇒ 那三张表**真实**影响的是：`gateOf` / `rejectedFor`（每次现算、无缓存）、
+        //   `pickerNameOf` / `isAllDefaultsUnopened`（每次 `listModels` 现算、无缓存），
+        //   以及 `routingFingerprint()` 的键。
+        // ⚠️ **而「改这三张表 ⇒ 候选序缓存失效」的**真实**机制是上一行那句
+        //   `clearChoiceCache()`**（候选序缓存 = `choiceCache`，60 秒 TTL）——
+        //   正确性其实由 `routingFingerprint()` 兜底（缓存键含这三张表的指纹），
+        //   `clearChoiceCache` 只是立即释放内存 + 语义更直白。
+        //
+        // ⚠️ **只失效 `aggregate` 一个**：失效全部渠道会让「改一个开关」连带作废
+        // 其余 11 家的目录缓存 ⇒ 用户改一个开关却付出十几个上游请求。
+        invalidateCatalogCache(AGGREGATE_PROVIDER)
         const value: RpcAggregateRejectionsResponse = {
           aggregateRejections: pool.listAggregateRejections(),
           // ⚠️ 必须同时回白名单：面板的逐条开关要按三态显示，只回拒绝表会让白名单条目
@@ -6394,6 +7011,12 @@ AUTOCLAW.id,
         await pool.clearAggregateRejected(req?.canonicalId, req?.provider)
         ctx.logger.info('[jet-hub] 聚合：已清空拒绝表（按传入的维度）')
         modelAdapters?.['aggregate']?.clearChoiceCache?.()
+        // ⚠️ **第 9 处**（2026-10-19 复审补齐）：兄弟端点 `aggregate.setRejected`
+        //   **已**接线，本端点写的是**同一张拒绝表**（只是按维度批量清空）⇒ 按接线
+        //   规则属必接线。上一行那句「漏掉任一处的 `clearChoiceCache`」说的正是它。
+        // ⚠️ 只失效 `aggregate` 自己（理由见 `setRejected` 那边）。
+        // ⚠️ 排在写入之后：上面的 `return` 是 bad-request，一个字都没改。
+        invalidateCatalogCache(AGGREGATE_PROVIDER)
         const value: RpcAggregateRejectionsResponse = {
           aggregateRejections: pool.listAggregateRejections(),
           aggregateAllowed: pool.listAggregateAllowed(),
@@ -6427,6 +7050,9 @@ AUTOCLAW.id,
           + `${req.canonicalId} 的候选 ${req.provider}/${req.realId}`,
         )
         modelAdapters?.['aggregate']?.clearChoiceCache?.()
+        // ⚠️ 与 `aggregate.setRejected` **逐条对齐**（漏一处两个方向就会不同步）：
+        //    额外失效 `aggregate` 自己的目录缓存，且**只**失效它一个（理由见那边）。
+        invalidateCatalogCache(AGGREGATE_PROVIDER)
         const value: RpcAggregateRejectionsResponse = {
           aggregateRejections: pool.listAggregateRejections(),
           aggregateAllowed: pool.listAggregateAllowed(),
@@ -6456,6 +7082,8 @@ AUTOCLAW.id,
         ctx.logger.info(`[jet-hub] 聚合：写入 ${req.canonicalId} 的手工顺序（${order.length} 条）`)
         // ⚠️ 顺序**参与**候选排序 ⇒ 顺序变了缓存里的候选序就失效了（指纹也含它，双保险）。
         modelAdapters?.['aggregate']?.clearChoiceCache?.()
+        // ⚠️ 同上：额外失效 `aggregate` 自己的目录缓存，且**只**失效它一个。
+        invalidateCatalogCache(AGGREGATE_PROVIDER)
         const value: RpcAggregateSetOrderResponse = { canonicalId: req.canonicalId, order }
         return { ok: true, value }
       }
@@ -6477,6 +7105,11 @@ AUTOCLAW.id,
         await pool.setAggregateOrderMode(req.mode)
         ctx.logger.info(`[jet-hub] 聚合：排序模式切换为「${req.mode === 'manual' ? '按手工' : '按临期'}」`)
         modelAdapters?.['aggregate']?.clearChoiceCache?.()
+        // ⚠️ **第 10 处**（2026-10-19 复审补齐）：`orderMode` 是
+        //   `routingFingerprint()` 的**四项输入之一**（`aggregate-adapter.ts`），
+        //   即「改这三张表 ⇒ 候选序缓存失效」的真实机制的一环 ⇒ 按接线规则属必接线。
+        // ⚠️ 只失效 `aggregate` 自己（理由见 `setRejected` 那边）。
+        invalidateCatalogCache(AGGREGATE_PROVIDER)
         const value: RpcAggregateSetOrderModeResponse = { orderMode: pool.listAggregateOrderMode() }
         return { ok: true, value }
       }
@@ -6498,6 +7131,12 @@ AUTOCLAW.id,
         const { cleared, aggregateAllowed } = await pool.clearAggregateAllowedExcept(WIRED_EXPIRY_PROVIDERS)
         ctx.logger.info(`[jet-hub] 聚合：一键拒绝非临期，恢复 ${cleared} 条候选为默认不参与`)
         modelAdapters?.['aggregate']?.clearChoiceCache?.()
+        // ⚠️ **第 11 处**（2026-10-19 复审补齐）：本端点写的是**聚合白名单**
+        //   （`clearAggregateAllowedExcept`）⇒ 与 `setAllowed` 同一张表，按接线
+        //   规则属必接线（`cleared === 0` 也算一次写入：幂等点击同样是「用户刚
+        //   要求过那个状态」，目录该重读一次）。
+        // ⚠️ 只失效 `aggregate` 自己（理由见 `setRejected` 那边）。
+        invalidateCatalogCache(AGGREGATE_PROVIDER)
         const value: RpcAggregateRejectNonExpiringResponse = { cleared, aggregateAllowed }
         return { ok: true, value }
       }

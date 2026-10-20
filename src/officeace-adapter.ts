@@ -21,6 +21,7 @@ import { OFFICEACE, OFFICEACE_MODELS } from './officeace-product.js'
 import { basicAuthorization, fetchModelTokenRates, isExpiring, readOfficeAceCredential, refreshStoredCredential, type OfficeAceCredential } from './officeace-auth.js'
 import { collectImages, consumeOpenAiSse, serializeMessages } from './openai-compat.js'
 import { registerAdapterIdempotent } from './llm-register-compat.js'
+import { isCatalogFreshFor } from './model-catalog.js'
 import { buildDsmlSystemPrompt, needsDsmlToolMode, type DsmlToolSpec } from './dsml.js'
 import {
   isBasicCredentialRejection,
@@ -134,6 +135,14 @@ export interface OfficeAceAdapterOptions {
   readImage?: (attachment: unknown) => Promise<{ data: Uint8Array; mediaType: string } | undefined>
   /** 黑名单模型 id（面板「显示列表」开关）。 */
   disabledModels?: () => ReadonlySet<string>
+  /**
+   * 目录新鲜度用的时钟（**只**用于 `isCatalogFresh`，不参与任何业务判定）。
+   *
+   * ⚠️ 缺省 `Date.now()`；注入它只是为了让「20 分钟 TTL」在单测里可推进，
+   *    业务语义（多久算新鲜）由 `model-catalog.ts` 的 `isCatalogFresh` **唯一**持有，
+   *    本家不得自己写第二份判据。
+   */
+  now?: () => number
   /** 目录可用后回调 —— 接线层注入 `broadcastCatalogChanged(ctx)`。 */
   onCatalogLoaded?: () => void
 }
@@ -163,6 +172,16 @@ export class OfficeAceAdapter extends LlmAdapter {
   private announced = false
   /** 倍率缓存（listModels 时填充，resolveModel 复用——保持两处名字一致）。 */
   private rateCache = new Map<string, number>()
+  /**
+   * 上次**成功**刷新目录的时刻（毫秒）；`0` = 从未成功读过。
+   *
+   * ⚠️ 它同时覆盖**两个独立端点**：`/v2/models` 探测与 `/v1/model-token-rates`
+   *    倍率。二者任一单独缓存都会让另一半每轮照旧打上游（倍率尤其致命 ——
+   *    用户原话就是「不更新就拿不到实际倍率」），故**共用同一个时刻**。
+   *
+   * ⚠️ 判据只有一份：`model-catalog.ts` 的 `isCatalogFresh`（周期 20 分钟）。
+   */
+  private catalogAt = 0
 
   constructor(private readonly options: OfficeAceAdapterOptions = {}) {
     super()
@@ -216,18 +235,56 @@ export class OfficeAceAdapter extends LlmAdapter {
     //    与锁定毫不相干的症状（面板「读取模型列表失败」、关不掉供应商、分组消失）。
     const credential = await this.probeCredential()
     if (credential === undefined) return []
-    try {
-      const probe = await this.probe(credential)
-      if (!probe) return []
-    } catch {
-      return []
+    // ⚠️⚠️ **20 分钟 TTL（本家是 23 家里唯一手写目录、此前每轮真打上游的一家）**：
+    //    `/v2/models` 探测与 `/v1/model-token-rates` 倍率**各是一次真实往返**
+    //    （实测日志稳定 80~340ms，其余 22 家是 1~17ms 的纯本地读）。
+    //
+    // ⚠️ **判据只有一份**：`isCatalogFresh`（`model-catalog.ts`，周期 20 分钟）。
+    //    本家不得自己写第二份「多久算新鲜」。
+    // ⚠️ 这里用 `isCatalogFreshFor`（多一个**正交**的「用户主动失效」输入）：
+    //    用户在 Jet Hub 改开关后要**立即**重拉目录（规格 §6 的正确性要求，
+    //    见 `invalidateCatalogCache`）。本家**不需要**「拉失败时别用失效判据」
+    //    那一条：它下面失败分支走的是 `this.catalogAt === 0` 而不是新鲜度判据
+    //    ⇒ 旧读数照常保留，不会退化。
+    // ⚠️ **两个端点共用这一个时刻**：单独缓存其一时，另一处仍每轮打上游 ——
+    //    而倍率恰恰是用户要求「20 分钟更新一次」的那一半（不更新就拿不到实际倍率）。
+    //
+    // ⚠️ **凭据仍每轮现取**：本地读凭据不花钱，而「换了账号/换了 `maasBaseUrl`」
+    //    只有在每次探测时才知道 —— 缓存住凭据会让新账号的目录迟迟不生效。
+    const catalogFresh = isCatalogFreshFor(OFFICEACE.id, this.catalogAt, this.options.now?.() ?? Date.now())
+    if (!catalogFresh) {
+      let probed = false
+      try {
+        probed = await this.probe(credential)
+      } catch {
+        probed = false
+      }
+      // ⚠️⚠️ **刷新失败必须保留旧读数、清空是错的**：空列表会让 DSH 的
+      //    `buildModelCatalog` **隐藏整个分组**（用户界面上一个模型都不剩，
+      //    且无日志）—— 而故障只是一次瞬时抖动。
+      //    `catalogAt` 也**不刷新**：刷新了就得再等满 20 分钟才会重试。
+      //
+      // ⚠️ **冷启动例外**：从未成功读过（`catalogAt === 0`）时没有「旧值」可留，
+      //    仍然诚实地返回 `[]` —— 这正是「凭据不可达 ⇒ 隐藏不可恢复的分组」
+      //    那条既有约定（锁定态 / 未登录的既有行为逐字不变）。
+      if (!probed) {
+        if (this.catalogAt === 0) return []
+      } else {
+        this.announceLater()
+        // 倍率（costCoefficient）：OfficeAce 主界面显示 `0.7x` 的那个值，来自
+        // `/v1/model-token-rates`（V11 签名，管理面 API —— 保持默认域，
+        // 见 `officeace-base-url.spec.ts` 的范围守卫）。取不到（未装 OfficeAce）时
+        // 优雅降级 —— 名字后不带 x 系数，模型照常可选。
+        const rates = await fetchModelTokenRates()
+        this.rateCache = rates
+        // ⚠️ **只在成功走到这里才记时刻**：失败不写（见上面的注释）。
+        this.catalogAt = this.options.now?.() ?? Date.now()
+
+      }
     }
-    this.announceLater()
-    // 倍率（costCoefficient）：OfficeAce 主界面显示 `0.7x` 的那个值，来自
-    // `/api/subscription/model-token-rates`。取不到（未装 OfficeAce）时优雅降级
-    // —— 名字后不带 x 系数，模型照常可选。
-    const rates = await fetchModelTokenRates()
-    this.rateCache = rates
+    // ⚠️ TTL 内的读数走**缓存倍率**（`rateCache`）；倍率拉不到时它是空表，
+    //    名字后不带 x 系数 —— 与首次拉取失败时的降级形态一致。
+    const rates = this.rateCache
     return OFFICEACE_MODELS
       .filter((m) => !disabled.has(m.id))
       .map((m) => {

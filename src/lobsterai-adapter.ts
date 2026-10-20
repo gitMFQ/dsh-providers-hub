@@ -30,7 +30,7 @@ import {
 import { ToolCallId } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
 import { AccountPool } from './account-pool.js'
-import { createModelCatalog, type CatalogEntry, type ModelCatalog } from './model-catalog.js'
+import { createModelCatalog, isCatalogFreshFor, type CatalogEntry, type ModelCatalog } from './model-catalog.js'
 import { RemoteCatalogGate } from './remote-catalog-gate.js'
 import { broadcastCatalogChanged } from './catalog-broadcast.js'
 import { parseRateLimitError } from './llm-adapter.js'
@@ -357,6 +357,15 @@ export interface LobsteraiAdapterOptions {
   ) => Promise<{ data: Uint8Array; mediaType: string } | undefined>
   /** 产品配置；默认 {@link LOBSTERAI}。 */
   product?: LobsteraiProduct
+  /**
+   * 时钟（注入以便单测推进目录 TTL；缺省 `Date.now`）。
+   *
+   * ⚠️ 只用于**目录新鲜度**（`ensureRemoteModels` 的 `isCatalogFresh`），
+   *    不用于超时/退避计时 —— 那些仍走真实时钟。
+   *    ⚠️ **buddy 是例外**：它的 `catalogGate` 也吃这个时钟（冷却与
+   *    「距上次尝试 ≥10 秒」判定都走它），所以别把本行当成全仓库通用口径。
+   */
+  now?: () => number
   /**
    * 远端目录**落地后**的通知回调（issue IKJVTF）。
    *
@@ -795,6 +804,13 @@ export class LobsteraiAdapter extends LlmAdapter {
   /** 动态模型缓存（首次 listModels 成功后填充）。 */
   private remoteModels: LobsteraiRemoteModel[] | undefined
   /**
+   * ⚠️ 上次**成功**读到远端目录的时刻（0 = 从未成功过）。
+   *
+   * ⚠️ 与 `remoteModels` **并存**、不是替代：`remoteModels` 存「有哪些模型」，
+   *    本字段存「何时读到的」。只有 `remoteModels` 时目录**永不刷新**（原行为）。
+   */
+  private catalogAt = 0
+  /**
    * 目录加载闸门：并发去重 + 失败/空结果冷却。
    * 依据见 `src/remote-catalog-gate.ts`（首屏「加载模型巨长」的实测归因）。
    */
@@ -828,6 +844,17 @@ export class LobsteraiAdapter extends LlmAdapter {
         product: this.product,
         loadCatalog: () => this.loadCatalogEntries(),
         syncCatalog: () => this.syncCatalogEntries(),
+        /**
+         * ★ **强制重拉**（供后台 20 分钟刷新器与「用户改设置」）。
+         *
+         * ⚠️ 与 `loadCatalog` 的差别：后者内部有 `isCatalogFresh` 判据 ⇒ 新鲜时**不拉**。
+         * 本回调要的是「无视新鲜度，强制拉一次」，故先清时刻再调同一个方法 ——
+         * **不另写一份拉取逻辑**（那会让两条路的上游行为分叉）。
+         */
+        refresh: async () => {
+          this.catalogAt = 0
+          await this.ensureRemoteModels()
+        },
         // ⚠️ 未知 id 保守报 `['text']`（见 `inputModalitiesFor`：
         // 「宁可少报能力，也不要报一个服务端不认的模态」）。
         unknownModelInputModalities: () => ['text'] as const,
@@ -849,20 +876,33 @@ export class LobsteraiAdapter extends LlmAdapter {
   }
 
   /**
-   * 懒加载远端模型目录（仅拉取一次）。
+   * 懒加载远端模型目录（**每 20 分钟**重新拉一次，用户 2026-10-18 的要求）。
    *
    * `listModels` 与 `resolveModel` 共用：`resolveModel` 可能先于 `listModels`
    * 被调用（如直接从历史会话进入），此时同样需要触发一次拉取。
    */
   private async ensureRemoteModels(): Promise<void> {
     const fetchRemote = this.options.fetchRemoteModels
-    if (this.remoteModels !== undefined || fetchRemote === undefined) return
+    // ⚠️ `fetchRemote === undefined` 那半边**原样保留** —— 它判的是「有没有远端
+    //    可拉」（无凭据/无接线），与新鲜度是两件事。
+    if (fetchRemote === undefined) return
+    // ⚠️ 判据来源：`isCatalogFresh`（`model-catalog.ts` 的**唯一**实现）。
+    // ⚠️ **入口用 `isCatalogFreshFor`**：用户在 Jet Hub 改开关后要**立即**重拉
+    //    （规格 §6 的正确性要求，见 `invalidateCatalogCache`）。本方法只有这一处
+    //    判据，且它在 gate **之前**（拉不到就用旧值），故整条路径都安全。
+    if (this.remoteModels !== undefined
+      && isCatalogFreshFor(this.product.id, this.catalogAt, this.options.now?.() ?? Date.now())) {
+      return
+    }
     // 闸门：并发去重 + 失败/空结果冷却（依据见 src/remote-catalog-gate.ts）。
     await this.catalogGate.run(async () => {
       const models = await fetchRemote()
       if (models.length === 0) return false
       this.remoteModels = models
       this.remoteMeta = new Map(models.map((model) => [model.id, model]))
+      // ⚠️ **只在成功赋值后**记时刻：失败/空结果不写，否则一次抖动会把上界
+      //    刷新掉、下轮还要等满 20 分钟才发现上游没恢复。
+      this.catalogAt = this.options.now?.() ?? Date.now()
       return true
     })
   }
@@ -956,6 +996,21 @@ export class LobsteraiAdapter extends LlmAdapter {
    * ⚠️ **2026-10-08 Task 7c**：骨架（含上面这条理由）已上移到共享实现
    * `src/model-catalog.ts`，此处只剩委托。
    */
+  /**
+   * ★ **后台目录刷新器入口**（`src/index.ts` 的 `refreshOf` 调 `adapter.refresh?.()`）。
+   *
+   * ⚠️⚠️ 必须由适配器**显式转发** `catalog.refresh`：`ModelCatalog`（`model-catalog.ts`）
+   *    上的这个成员**不会**自动变成适配器的成员 —— `pruned()` 的 Proxy 只透传
+   *    **适配器自己的**成员（`dead-model-store.ts:748-749`）。
+   *    漏转发 ⇒ 刷新器「已武装」却对这家**空转**，且**零日志**（`refreshOf` 返回
+   *    `undefined` 时静默跳过 —— `index.ts` 的装配注释写着这件事）。
+   *    ⚠️ 与 `options.refresh`（HTTP 401 后的**凭据**重取）**不是同一件事**，
+   *    两者同名纯属巧合，**不得合并**。
+   */
+  async refresh(): Promise<void> {
+    await this.catalog.refresh?.()
+  }
+
   listAllModels(): readonly { id: string; name: string }[] {
     return this.catalog.listAllModels()
   }

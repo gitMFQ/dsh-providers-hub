@@ -108,12 +108,13 @@ describe('account.refresh 分派（T7 回归）', () => {
     //    （豁免的**理由**由 `jet-hub-rpc-auth-wiring.spec.ts` 逐条验证，本文件不重复。）
     // ⚠️ 2026-10-13 合并：officeace 与 accio **同一次**并入，故 13 → 15。
     // ⚠️ 2026-10-15 加 minimaxintl（MiniMax Code 国际版）：15 → 16。
-    // ⚠️ 2026-10-17 加 autoclaw（AutoClaw/智谱）：16 → 17；
-    //    同日 **本 fork** 并入 modelscope（魔搭）：17 → 18。
+    // ⚠️ 2026-10-16 astudio 并入（goal 302 接线）：16 → 17。
+    // ⚠️ 2026-10-17 加 autoclaw（AutoClaw/智谱）：17 → 18；
+    //    同日 **本 fork** 并入 modelscope（魔搭）：18 → 19。
     expect(
       EXPECTED_REFRESH_PROVIDER_IDS,
       'channel 集合变了，请复核 opencode 豁免是否仍成立（见 AUTH_EXEMPT）',
-    ).toHaveLength(18)
+    ).toHaveLength(19)
   })
 
   it('buddy 账号刷新**自己的** credentialRef，而不是默认单凭据 ref', async () => {

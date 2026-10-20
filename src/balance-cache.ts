@@ -51,6 +51,24 @@
  */
 
 import { TtlCache } from './ttl-cache.js'
+import type { ProviderAccountEntry } from './types.js'
+
+/** 陈旧兼顶的默认上界（15 分钟）。 */
+const DEFAULT_STALE_TTL_MS = 900_000
+/**
+ * 刷新周期缺省值（60 秒 = 共享缓存 `ttlMs` 的一半）。
+ *
+ * ⚠️ **理由（别丢）**：周期恰等于 `ttlMs` 时，条目会在**刚过期的那一刻**才被刷
+ * ⇒ 读路径仍会频繁撞上「陈旧且后台刚开始刷」，常新目标落空。取一半 ⇒ 任何时刻
+ * 至少有半个周期的余量。
+ *
+ * ⚠️ **刻意不新增第三套 TTL 常量**：它与 `ttlMs` 是**同一条语义的两个尺度**
+ * （缓存寿命 / 保鲜节奏），写死一份会让人以为二者可以各自独立调。
+ *
+ * ⚠️ **导出**是为了装配层不再写死同一个字面量（`src/index.ts` 的 `intervalMs`）——
+ * 那正是「提常量」要消除的重复；装配层**必须**引用本常量而不是重打一遍 `60_000`。
+ */
+export const REFRESH_PERIOD_FALLBACK_MS = 60_000
 
 /**
  * 一个账号的一条读数。
@@ -204,6 +222,33 @@ export interface BalanceCache {
   /** 只看缓存、不触发加载（面板用它显示「数据时间」）。未知键 / 已过期 ⇒ `undefined`。 */
   peek(provider: string, accountId: string): BalanceReading | undefined
   /**
+   * ★ 只看**过期后**的条目（不触发加载，**且不丢弃**它）。刷新器用它判「该不该刷」。
+   *
+   * ## 与 {@link BalanceCache.peek} 的差别**只有**「不丢弃过期条目」
+   *
+   * ⚠️ `peek()` 在条目过期那一刻会顺手丢弃（`src/ttl-cache.ts:129`）⇒
+   * 拿它判「有多旧 / 是不是失败读数」会恒拿到 `undefined`。
+   * ⇒ 两条语义各占一个方法名（`TtlCache` 也是这么分的），调用点**写死**。
+   */
+  peekStale(
+    provider: string,
+    accountId: string,
+  ): (BalanceReading & { stale: true | false }) | undefined
+  /**
+   * ★ 后台重取**单个**账号（供 {@link createBalanceRefresher} 调用）。
+   *
+   * ⚠️ **不返回读数**：后台重取的价值全在「把新值写进缓存」，而调用方
+   *   （读路径）刻意不等它。返回读数会诱使消费方误用它。
+   * ⚠️ 失败已被 `fetchReading` 记成 `{ error }` 读数（模块头约束 3）；**abort
+   *   会原样上抛**（约束 1），故刷新器侧必须 `.catch`（它刻意吃掉并记日志 ——
+   *   后台刷新没有调用方可通知）。
+   */
+  refreshOne(
+    provider: string,
+    accountId: string,
+    entry: { credential?: unknown },
+  ): Promise<void>
+  /**
    * 取**一个**账号的读数（供「手上只有凭据、没有账号池条目」的路径用 —— 聚合折算）。
    *
    * ⚠️ 与 {@link read} 的差别只有**入参形态**：两者**共用同一份缓存**
@@ -289,7 +334,7 @@ export function createBalanceCache(options: BalanceCacheOptions): BalanceCache {
   const failureTtlMs = options.failureTtlMs ?? 15_000
   // ⚠️ 陈旧兼顶的**上界**必须有（见 `staleTtlMs` 的注释）：无界兼顶会让一次
   //   读数命中后永久生效，用户看到一天前的余额而 UI 只写「来自 HH:MM」。
-  const staleTtlMs = options.staleTtlMs ?? 900_000
+  const staleTtlMs = options.staleTtlMs ?? DEFAULT_STALE_TTL_MS
   const isAbort = options.isAbort ?? defaultIsAbort
   const now = options.now ?? (() => Date.now())
   /** `provider\0accountId` → 该账号的缓存实例（懒建，与 `usage-badge.ts:180-191` 同款）。 */
@@ -385,6 +430,82 @@ export function createBalanceCache(options: BalanceCacheOptions): BalanceCache {
     return created
   }
 
+  /**
+   * ★ 读路径的统一入口：命中新鲜值直返；命中陈旧值**立刻返回旧值**并标 `stale`。
+   *
+   * ## ⚠️ 读路径**不发任何请求**（本设计的核心不变量）
+   *
+   * 陈旧命中时**既不 await 也不 `void` 发起后台重取** —— 重取由**后台刷新器**
+   * 负责（同文件末尾的 `createBalanceRefresher`，2026-10-18 已实现）。⇒「逐账号串行取数」这条
+   * 铁律（模块头约束 2）在读路径上**天然成立**：这里一个请求都不发；**刷新器侧自己承担
+   * 串行**（它才是新的请求来源）。
+   *
+   * ## ⚠️ 为什么曾经在这里发过后台重取，以及为什么被撤掉（实测缺陷）
+   *
+   * 上一版（提交 `94ae01b` 的 stale-while-revalidate）在陈旧命中时写了
+   * `void cache.get().catch(() => {})`。`read` 的 `for…of` 循环里，
+   * `await getServingStale(...)` 在陈旧命中时**立即 resolve**（返回旧值），
+   * 但那个后台取数的 promise **仍在飞** ⇒ 循环随即进入下一个账号，
+   * 于是 `a2` 的重取与 `a1` 的**重叠**。
+   *
+   * 实测（两个陈旧账号）：`maxInflight = 2`，
+   * `order = ["start:a1", "start:a2", "end:a1", "end:a2"]`
+   * （基线版本恒为 `maxInflight = 1`）⇒ 用户症状是「切 provider 面板时一次性向
+   * 同一上游打出 N 个并发请求」⇒ 触发风控。
+   *
+   * ⇒ 守卫：`tests/unit/balance-cache.spec.ts` 的
+   *   「★★ 陈旧读路径下 `read` **一次请求都不发**」。
+   *
+   * ## 为什么不是 `cache.get()`
+   *
+   * `TtlCache.get()` 在条目一过 `ttlMs` 就同步回源 ⇒ 切 provider 面板时用户必须
+   * 等一次完整上游往返（loomy 单请求上限 60s，见 `src/loomy.ts:45`）。
+   *
+   * ## 三条必须遵守的语义
+   *
+   * 1. **没有旧值时照常回源**：兼顶**不得**取代真实取数能力，否则未接线的渠道
+   *    会恒不可用。冷启动仍要等一次真读 —— 这是本设计**刻意接受**的（规格 §3.2）。
+   * 2. **`force` 不走本函数**：强制刷新必须同步等真实取数（见 `read`/`readOne`
+   *    里的早退分支）。
+   * 3. **陈旧值不写回 `TtlCache` 槽位**：`readStale` 已有同款约定（`readStale`
+   *    的注释）—— 让失败读数占住唯一槽位会毁掉兼顶能力。
+   *
+   * @param provider - 渠道 id（回源需要；**必须是显式入参** —— `BalanceCacheEntry`
+   *   上**没有** `providerHint` 字段，只有 `id` 与 `credential`）
+   * @param key - `provider\0accountId`
+   * @param cache - 该键的缓存实例
+   * @param entry - 取数所需的条目（`load` 从槽里取）
+   */
+  const getServingStale = async (
+    provider: string,
+    key: string,
+    cache: TtlCache<BalanceReading>,
+    entry: BalanceCacheEntry,
+  ): Promise<BalanceReading> => {
+    // ⚠️ **只能用 `peekStale()`，不可改成先调 `peek()`**（它会销毁兼顶来源）。
+    //
+    // `TtlCache.peek()` 在条目过期那一刻会**顺手丢弃**它（`src/ttl-cache.ts:129`
+    // 的 `this.entry = undefined`）⇒ 若先调 `peek()`，条目已被销毁，
+    // 随后的 `peekStale()` 恒为 `undefined` ⇒ 兼顶分支**永远走不到**
+    // （实测：改回 brief 的 `peek()` 在前写法，两条新用例实测恒红）。
+    // ⇒ 这里只用 `peekStale()` 一条判据：它对新鲜/过期**都**返回条目并带 `stale` 标记。
+    const held = cache.peekStale()
+    if (held !== undefined && held.stale !== true) return held.value
+    if (held !== undefined && held.value.value !== undefined) {
+      // ⚠️⚠️ **读路径在这里不发任何请求**（不 await、也不 `void` 后台重取）：
+      //    见上面「读路径不发任何请求」的实测记录 —— 在 `for…of` 里发后台重取会
+      //    让相邻账号的取数**重叠**（实测 `maxInflight = 2`）⇒ 并发打上游触发风控。
+      //    重取由后台刷新器负责（`createBalanceRefresher`，同文件末尾）。
+      // ⚠️ 诚实登记：本条路径返回**副本**（`{ ...held.value, stale: true }`），
+      //    而上面的新鲜路径返回缓存对象**本体**。这个不对称是**既有行为**，
+      //    本次**不改**；记在这里是为免后人误以为它是有意设计的语义差别。
+      return { ...held.value, stale: true }
+    }
+    // 没有可兼顶的值 ⇒ 照常回源（冷启动路径）。
+    slots.set(key, { provider, entry })
+    return await cache.get()
+  }
+
   return {
     async read(provider, entries, readOptions = {}) {
       const out = new Map<string, BalanceReading>()
@@ -393,9 +514,17 @@ export function createBalanceCache(options: BalanceCacheOptions): BalanceCache {
         if (typeof entry?.id !== 'string') continue
         const key = keyOf(provider, entry.id)
         slots.set(key, { provider, entry })
+        const cache = cacheOf(key)
         // ⚠️ `force` 只影响**这一次**读取（**不** `clear()` 缓存）：面板「刷新」不该
         //    顺手把徽标正在用的读数也作废 —— 两者**共享**这份缓存，正是本模块的意义。
-        out.set(entry.id, await cacheOf(key).get({ force: readOptions.force === true }))
+        // ⚠️ `force` 直接走 `get()`（同步等真实取数），**不走兼顶** ——
+        //    否则面板「刷新积分」会变成假按钮。
+        out.set(
+          entry.id,
+          readOptions.force === true
+            ? await cache.get({ force: true })
+            : await getServingStale(provider, key, cache, entry),
+        )
       }
       return out
     },
@@ -404,12 +533,39 @@ export function createBalanceCache(options: BalanceCacheOptions): BalanceCache {
       return perAccount.get(keyOf(provider, accountId))?.peek()?.value
     },
 
+    peekStale(provider, accountId) {
+      const entry = perAccount.get(keyOf(provider, accountId))?.peekStale()
+      // ⚠️ `stale` 标记必须**带出来**：无它时刷新器分不清「新鲜」与「过期」，
+      //   而本接口的签名（`& { stale: true | false }`）承诺了它。
+      return entry === undefined ? undefined : { ...entry.value, stale: entry.stale }
+    },
+
+    /**
+     * ★ 后台重取**单个**账号（供刷新器调用）。
+     *
+     * ⚠️ 走 `force: true`：刷新器**只**在自己判完「该刷」之后才调这里，所以这里
+     *   必须绕过 TTL 与兼顶，否则「已过周期但仍在 TTL 内」那档会刷成空操作。
+     * ⚠️ 槽里必须带 `credential`：`fetchBalanceReading`（`src/index.ts`）在
+     *   `entry.credential === undefined` 时直接抛「凭据未提供」⇒ 刷新器**必须**
+     *   解析出凭据再调本方法，否则每一轮都记成失败读数。
+     */
+    async refreshOne(provider, accountId, entry) {
+      const key = keyOf(provider, accountId)
+      slots.set(key, { provider, entry: { id: accountId, ...entry } })
+      await cacheOf(key).get({ force: true })
+    },
+
     async readOne(provider, accountId, entry, readOptions = {}) {
       const key = keyOf(provider, accountId)
       // ⚠️ 槽里必须带 `id`：`fetch` 的签名吃 `BalanceCacheEntry`（各渠道的取数原语
       //    要用它做日志/二次查询），而本方法的入参只有 `credential`。
       slots.set(key, { provider, entry: { id: accountId, ...entry } })
-      return await cacheOf(key).get({ force: readOptions.force === true })
+      const cache = cacheOf(key)
+      // ⚠️ **返回值的 `stale` 字段**：聚合折算侧据此判 `UNUSABLE`（Task 3）。
+      //    ⚠️ `force` 不兼顶：用户点「刷新」就是要看真实结果（见 `readStale` 的同款约定）。
+      return readOptions.force === true
+        ? await cache.get({ force: true })
+        : await getServingStale(provider, key, cache, { id: accountId, ...entry })
     },
 
     /**
@@ -520,3 +676,286 @@ export function createBalanceCache(options: BalanceCacheOptions): BalanceCache {
     },
   }
 }
+
+/** 后台刷新器的构造选项。见 {@link createBalanceRefresher}。 */
+export interface BalanceRefresherOptions {
+  /**
+   * 列出**全部** provider 的账号（含停用），供刷新器决定刷什么。
+   *
+   * ⚠️ 类型是 `ProviderAccountEntry`（**不是** `ProviderAccountStatus`）——
+   *    前者才有 `enabled` / `credentialRef` / `provider` 三个刷新器要读的字段。
+   * ⚠️ 返回 Promise 与返回数组**都吃**（内部一律 `await`），故既可接
+   *    `pool.listAllAccounts()`（实测是 `async`，见 `src/account-pool.ts:1308`），
+   *    也可接同步的 `listAccountsByProvider` 拼接。
+   */
+  listAccounts(): readonly ProviderAccountEntry[] | Promise<readonly ProviderAccountEntry[]>
+  /**
+   * ★ 按 `credentialRef` **解析**出已解析的凭据（返回 `undefined` = 取不到）。
+   *
+   * ## ⚠️ 为什么必须有这一腿（不是「顺手加的」）
+   *
+   * 生产取数原语 `fetchBalanceReading`（`src/index.ts`）在
+   * `entry.credential === undefined` 时**直接抛「凭据未提供」** ⇒ 刷新器若传空
+   * entry，**每一轮都会被记成失败读数**：外面看「刷新器在跑」，实则永远拿不到新值。
+   *
+   * ⚠️ 解析失败（返回 `undefined`）时刷新器**跳过该账号、不打上游** ——
+   *   必然失败的请求只是浪费，还会让失败读数把该账号推进「跳过窗口」。
+   */
+  resolveCredential?(credentialRef: string): Promise<unknown>
+  /** 取当前时刻（注入以便单测）。 */
+  now?(): number
+  /** 日志出口。 */
+  info?(message: string): void
+  warn?(message: string): void
+  /** 兼顶上界的缺省值（默认 {@link DEFAULT_STALE_TTL_MS}）。 */
+  staleTtlMs?: number
+  /** 定时器工厂（注入以便单测用假时钟）。缺省用全局 `setInterval`。 */
+  setInterval?: (fn: () => void, ms: number) => { unref?: () => void }
+  /** 刷新周期（毫秒）。缺省 {@link REFRESH_PERIOD_FALLBACK_MS}（= 共享缓存 `ttlMs` 的一半）。 */
+  intervalMs?: number
+}
+
+/** 后台刷新器实例。见 {@link createBalanceRefresher}。 */
+export interface BalanceRefresher {
+  /** 武装定时器（**幂等**）。 */
+  start(): void
+  /** 立即跑一轮（调用方不必 await —— 单测与装配都直接返回它）。 */
+  tick(): Promise<void>
+  /** 解除武装（重复调用无害）。 */
+  stop(): void
+  /** 是否已武装（诊断 / 守卫用）。 */
+  isArmed(): boolean
+}
+
+/**
+ * ★ 后台刷新器：定时把**该刷的**条目重取一遍，让缓存常新。
+ *
+ * ## 为什么需要它（用户 2026-10-18 的原话）
+ *
+ * 「这个缓存不是应该一直存在并且自动在 2 分钟重新刷新，我们外面的请求是一直都缓存，
+ * 和缓存每 2 分钟自己更新一次不矛盾，为什么 2 分钟后再读就过期了要重新直读呢？
+ * 这个 2 分钟是 interval 不是 timeout」
+ *
+ * ⇒ 原实现是 **cache-aside**（读驱动）。读路径改成 stale-while-revalidate 后，
+ *   陈旧命中**一个请求都不发**（提交 `a725101`：发了会与相邻账号的重取重叠，
+ *   实测 `maxInflight = 2` ⇒ 触发风控）⇒ 重取这条腿**只剩本类**。
+ *   本类补上「后台」那一半。
+ *
+ * ## 周期取值：默认 `ttlMs` 的一半
+ *
+ * 周期恰等于 `ttlMs` 时，条目会在**刚过期的那一刻**才被刷 ⇒ 读路径仍会频繁撞上
+ * 「陈旧且后台刚开始刷」，常新目标落空。取一半 ⇒ 任何时刻至少有半个周期的余量。
+ *
+ * ## ⚠️ 三条判据（各对应一个真缺陷）
+ *
+ * | 条目状态 | 刷？ | 理由 |
+ * |---|---|---|
+ * | 从未读过 | ✅ | 否则它永远进不了缓存 |
+ * | 成功读数，已过一个刷新周期 | ✅ | 正常保鲜 |
+ * | 成功读数，仍在周期内 | ❌ | 没必要（读请求会命中，省一次上游） |
+ * | 失败读数，未超 `staleTtlMs` | ❌ | 否则**每 15 秒打一次上游** |
+ * | 失败读数，已超 `staleTtlMs` | ✅ | 不得永久卡在失败上 |
+ *
+ * ⚠️ 「失败条目跳过」是**新增判断**：失败读数走 15s 短 TTL，本意是
+ * 「别把一次抖动缓存成『额度用尽』」；若每轮都重试，正好违背这条规则的原意。
+ * 失败期间由 `lastSuccess` 的旧值兼顶着。
+ *
+ * ## ⚠️ 逐账号**串行**是本类的**承重约束**
+ *
+ * `a725101` 之前，串行由「读路径的 `for…of` + `await`」天然保证；删掉读路径的后台
+ * 重取之后，**本类成了新的请求来源**，串行必须自己扛 ——
+ * 守卫见 `tests/unit/balance-cache.spec.ts` 的「刷新**逐账号串行**」（**两个**账号，
+ * 单账号时串行与并行不可区分）。
+ *
+ * ## 停用账号低频刷（不完全不刷）
+ *
+ * 停用只影响自动选号（仓库铁律「续期不得按 `enabled` 过滤」），凭据仍需保鲜 ——
+ * 用户重新启用时不该拿到死凭据。但用户看不到它们，不值得每轮都打。
+ * ⇒ 判据**从 `staleTtlMs` 派生，不新增常量**。
+ */
+export function createBalanceRefresher(
+  cache: BalanceCache,
+  options: BalanceRefresherOptions,
+): BalanceRefresher {
+  const now = options.now ?? (() => Date.now())
+  const staleTtlMs = options.staleTtlMs ?? DEFAULT_STALE_TTL_MS
+  const periodMs = options.intervalMs ?? REFRESH_PERIOD_FALLBACK_MS
+  const setIntervalImpl = options.setInterval
+    ?? ((fn: () => void, ms: number) => setInterval(fn, ms))
+  /**
+   * ⚠️ 注入假定时器时**不得**用全局 `clearInterval` 去停它（句柄对不上，会静默
+   * 停不掉真定时器或抛错）⇒ 分流：只有用全局工厂时才走 `clearInterval`。
+   */
+  const clearImpl = options.setInterval === undefined
+    ? (handle: unknown) => { clearInterval(handle as ReturnType<typeof setInterval>) }
+    : () => {}
+  let timer: { unref?: () => void } | undefined
+  /** ⚠️ **防重入闸门**必须有：一轮含真实网络请求（可达数十秒）。 */
+  let running = false
+  /**
+   * ★ 刷新器**诞生时刻**（`startEpoch`）：用来判定「这个账号从进程起来到现在
+   *   有没有刷过」，作为「从未刷过」的兜底起点。
+   *
+   * ## ⚠️ 为什么不能写 `?? 0`（第一版的实测缺陷）
+   *
+   * `lastFlushedAt.get(key) ?? 0` ⇒ `now() - 0` 恒等于「当前时刻」，而真实时刻
+   * 远大于任何 `staleTtlMs` ⇒ **判据恒真** ⇒ 首轮就把**每条**失败条目和**每条**
+   * 停用账号全刷一遍（恰好违背这两条要防的事）。
+   *
+   * ## ⚠️ 也不能直接「没有记录就跳过」（第二版的实测缺陷）
+   *
+   * 那会让「从未刷过」的条目**永远**刷不到：停用账号（首轮跳过）再没有任何事件
+   * 给它补上 `lastFlushedAt` ⇒ 它再也不被低频刷新 ⇒ 用户重新启用时是死凭据
+   * （守卫「停用账号到点必须被刷」「超兼顶上界后必须重试」实测红）。
+   *
+   * ⇒ 正确语义：**「距上次刷新（或进程诞生）够不够久」**，缺省起点取 `startEpoch`。
+   *   `now() - startEpoch` 随时间单调增长 ⇒ 停用账号首轮跳过、之后必到点。
+   */
+  const startEpoch = now()
+  /** 上次刷过的时刻（`provider\0accountId` → 毫秒）；**只**用于停用账号的低频节奏。 */
+  const lastFlushedAt = new Map<string, number>()
+  /**
+   * 「距上次刷过多久」的缺省起点（无记录 ⇒ 取 `startEpoch`）。
+   *
+   * ⚠️ 缺省**不能**写 `0`：真实时刻远大于任何 `staleTtlMs` ⇒ 判据恒真
+   * ⇒ 停用账号首轮就被刷一遍（恰好违背「低频」这条要防的事）。
+   */
+  const lastFlushedOr = (key: string): number => lastFlushedAt.get(key) ?? startEpoch
+  const keyOf = (provider: string, accountId: string) => `${provider}\u0000${accountId}`
+
+  /** 该不该刷这一条（供 `tick` 的逐账号循环调用）。 */
+  const isDue = (provider: string, accountId: string): boolean => {
+    const held = cache.peekStale(provider, accountId)
+    // 从未读过 ⇒ 必须刷（否则它永远进不了缓存）
+    if (held === undefined) return true
+    // ⚠️⚠️ 读 **`held.at`**（`BalanceReading` 自己的字段），不是 `held.value.at`
+    //   —— `BalanceCache.peekStale` 返回的**就是** `BalanceReading` 本体（顶层
+    //   `{ at, value, error? }`），再点一层 `.value` 得到的是**上游原样返回值**，
+    //   `.at` 恒 `undefined` ⇒ `age` 恒 `NaN` ⇒ **下面两条判据全部恒假**，
+    //   刷新器**一轮都不会刷**（而外面看它跑得好好的、零报错 —— 恒绿形态）。
+    const age = now() - held.at
+    // 成功读数：已过一个刷新周期才刷（周期内读请求会命中，省一次上游）
+    if (held.error === undefined) return age >= periodMs
+    // ⚠️ 失败读数：**只在**超兼顶上界时重试。否则每 failureTtlMs(15s) 打一次上游
+    //    ——比现状更糟，且正好违背「短 TTL 防把抖动伪装成额度用尽」的原意。
+    //
+    // ⚠️⚠️ **这里只有一条腿，是有意简化过的**（第一版有两条，实测证明它们
+    //    **恒等价** ⇒ 属本仓库红线「同一语义两套判据」）：
+    //      · 原第一腿 `age >= staleTtlMs`：读槽位年龄；
+    //      · 原第二腿 `now - lastFlushedAt >= staleTtlMs`：读「上次刷过」。
+    //    刷新器写失败读数时两者**同一轮同一时刻**写入 ⇒ 数学上恒等价；
+    //    读路径（`readStale`）写的失败读数则只有槽位年龄在走，而那**同样**够到上界。
+    //    ⇒ 两条腿合并成「槽位年龄」这一条，语义不变、判据减半。
+    return age >= staleTtlMs
+  }
+
+  const tick = async (): Promise<void> => {
+    if (running) {
+      options.warn?.('[jet-hub] 上一轮余额刷新尚未结束，跳过本轮')
+      return
+    }
+    running = true
+    try {
+      const accounts = await options.listAccounts()
+      // ⚠️ **逐账号串行**（模块头约束 2）：并发打上游会触发风控。**不得** `Promise.all`。
+      for (const account of accounts) {
+        if (typeof account?.id !== 'string' || typeof account?.provider !== 'string') continue
+        const key = keyOf(account.provider, account.id)
+        // 停用账号走低频节奏（`staleTtlMs`），启用账号每轮都可能被刷。
+        // ⚠️ 缺省起点取 `startEpoch`（`?? 0` 会让判据恒真，见 `startEpoch` 的注释）：
+        //    首轮跳过 ⇒ 之后时钟推进到点时它**必**被刷（重新启用时不是死凭据）。
+        if (account.enabled === false
+          && now() - lastFlushedOr(key) < staleTtlMs) continue
+        if (!isDue(account.provider, account.id)) continue
+        // ⚠️⚠️ **凭据解析必须在逐账号的 `try` 之内**（2026-10-18 复审 Important 修正）。
+        //
+        // ## 为什么不放外面（原实现的缺陷形态）
+        //
+        // 装配层的 `resolveCredential`（`src/index.ts`）第一件事就是
+        // `credentialRef(account.credentialRef)`，而它对不匹配
+        // `/^[A-Za-z_][A-Za-z0-9_]*$/` 的名字**同步抛 `TypeError`**；
+        // `ctx.credentials.resolve` 也可能 reject。
+        // ⇒ 放外面时被**外层那个兜底**接住 ⇒ **一个坏账号让这一轮剩下的账号全部不刷**，
+        //   且只留一条文案为「读账号列表失败」的 warn（**与真因不符** ——
+        //   账号池读得好好的，坏的是某一个账号的凭据名）。
+        //
+        // ## 可达性（不是假想敌）
+        //
+        // `sanitizeAccounts`（`src/jet-hub-store.ts`）只校验 `credentialRef` 是非空字符串、
+        // **不校验命名法**；账号池又可从用户可编辑的备份导入 ⇒ 一份手改备份就能造出该条目。
+        // ⇒ 症状是本仓库最怕的形态：**功能整体死掉 + 只有一条措辞错误的 warn**。
+        //
+        // ## 为什么 `jet-hub-rpc.ts` 的同名闭包本轮**不动**
+        //
+        // 那边的 `resolveCredentialForCache` 有同样的问题，但它**已经在逐账号 `try` 内**
+        // （该文件 L864 的注释已写明「关键约束：凭据解析也在 try 之内」）⇒ 炸不到别的账号。
+        // 本条补的是**同一个缺陷、不同的爆炸半径**，故只修刷新器这一处。
+        //
+        // ## 为什么 catch 里还要分 `stage`
+        //
+        // 凭据名解析失败与「上游取数失败」是两件完全不同的事，而这条 warn 是
+        // 用户/维护者**唯一**能看到的线索 ⇒ 合并成「刷新余额失败」等于把真因埋掉。
+        // ⚠️⚠️ **`stage` 必须声明在 `try` 之外**：`catch` 里读它，而声明在 `try` 体内的
+        //   `let` 在异常路径上不可见 ⇒ 第一版写在 `try` 里，实测报
+        //   `ReferenceError: stage is not defined` ⇒ **异常冒到外层兜底**
+        //   （与本次要修的缺陷**完全同形**：整轮作废 + 措辞错误的 warn）。
+        let stage = '解析凭据'
+        try {
+          // ⚠️ 凭据取不到就**不打上游**：那一枪必然失败（见 `resolveCredential` 的注释）。
+          let credential: unknown
+          if (options.resolveCredential !== undefined) {
+            credential = await options.resolveCredential(account.credentialRef)
+            if (credential === undefined) continue
+          }
+          stage = '取数'
+          await cache.refreshOne(account.provider, account.id, { credential })
+          lastFlushedAt.set(key, now())
+        } catch (error) {
+          // ⚠️ 绝不上抛：一轮失败不得让定时器停摆（`refresh-scheduler.ts` 同款）。
+          //    abort 在此被吃掉是**刻意的**：后台刷新没有调用方可通知，
+          //    而 abort 铁律约束的是**读路径**（本模块头约束 1）。
+          const cause = error instanceof Error ? error.message : String(error)
+          if (stage === '解析凭据') {
+            options.warn?.(
+              `[jet-hub] 解析账号 ${account.id} 的凭据失败（ref=${account.credentialRef}），`
+              + `已跳过该账号：${cause}`,
+            )
+            continue
+          }
+          options.warn?.(
+            `[jet-hub] 后台刷新余额失败（账号 ${account.id}，照常继续）：${cause}`,
+          )
+        }
+      }
+    } catch (error) {
+      // ⚠️ `listAccounts` 抛错同样不得让定时器停摆（账号池尚未落盘等）。
+      options.warn?.(
+        `[jet-hub] 后台刷新读账号列表失败（照常继续）：`
+        + `${error instanceof Error ? error.message : String(error)}`,
+      )
+    } finally {
+      running = false
+    }
+  }
+
+  return {
+    start() {
+      // ⚠️ **幂等**：重复武装会叠加出多个 interval，刷新频率随登录/重启次数翻倍
+      //（`MultiAccountRefreshScheduler.notifyAccountAdded` 的同款理由）。
+      if (timer !== undefined) return
+      timer = setIntervalImpl(() => { void tick() }, periodMs)
+      timer.unref?.()                          // 不拦进程退出（与既有定时器同款）
+      options.info?.(
+        `[jet-hub] 余额缓存后台刷新器已武装（每 ${Math.round(periodMs / 1000)} 秒一轮）`,
+      )
+    },
+    tick,
+    stop() {
+      if (timer === undefined) return
+      clearImpl(timer)
+      timer = undefined
+    },
+    isArmed: () => timer !== undefined,
+  }
+}
+

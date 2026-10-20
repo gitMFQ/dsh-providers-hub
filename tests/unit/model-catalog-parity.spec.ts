@@ -78,6 +78,7 @@ import { QoderAdapter } from '../../src/qoder-adapter.js'
 import { RaccoonAdapter } from '../../src/raccoon-adapter.js'
 import { TraeAdapter } from '../../src/trae-adapter.js'
 import { ZcodeAdapter } from '../../src/zcode-adapter.js'
+import { AstudioAdapter } from '../../src/astudio-adapter.js'
 import { fallbackToEntry } from '../../src/minimax.js'
 import { MINIMAX, MINIMAX_INTL } from '../../src/minimax-product.js'
 import { CODEBUDDY, WORKBUDDY } from '../../src/product.js'
@@ -641,6 +642,16 @@ id: 'autoclaw',
         accountPool: { opencodeProxyFor: () => undefined } as never,
       } as never),
     },
+    {
+      id: 'astudio',
+      make: () => new AstudioAdapter({
+        ...NO_CRED,
+        // ⚠️ **不注入 fetchRemoteModels、也不注入 auth**：astudio-adapter.ts 的
+        //    loadModels 在 fetcher 为 undefined 时 warn 后**直接**回退
+        //    product.fallbackModels（ASTUDIO 兜底表 6 条），一个请求都不发 ⇒ 本条目
+        //    与上面的 accio 同款是零网络的。
+      } as never),
+    },
   ]
 
   /**
@@ -689,14 +700,73 @@ id: 'autoclaw',
     //    `channel: false` 的聚合器，不在此列）。
     //    ⚠️ 2026-10-13 合并：officeace 与 accio **同一次**并入，故 14 → 16。
     //    ⚠️ 2026-10-15 加 minimaxintl（MiniMax Code 国际版）：16 → 17。
-    //    ⚠️ 2026-10-17 加 autoclaw（AutoClaw/智谱）：17 → 18。
+    //    ⚠️ 2026-10-16 astudio 并入（goal 302 接线）：17 → 18。
+    //    ⚠️ 2026-10-17 加 autoclaw（AutoClaw/智谱）：18 → 19；
+    //    同日 **本 fork** 并入 modelscope（魔搭）：19 → 20。
+    //    ⚠️ 合并上游时**不要**改回 17（那会让 modelscope 失去本段全部对拍）。
     const { PROVIDER_REGISTRY } = await import('../../src/provider-registry.js')
     const channels = PROVIDER_REGISTRY.filter(d => d.channel).map(d => d.id).sort()
     expect(CASES.map(c => c.id).sort()).toEqual(channels)
-    // ⚠️ 2026-10-16 **本 fork** 并入 modelscope ⇒ 17 → 18；
-    //    2026-10-17 加 autoclaw（AutoClaw/智谱）⇒ 18 → 19。
-    //    合并上游时**不要**改回 17（那会让 modelscope 失去本段全部对拍）。
-    expect(CASES).toHaveLength(19)
+    expect(CASES).toHaveLength(20)
+  })
+
+  it('★★ `catalog` 具备 `refresh` 的家，适配器上必须**存在** `refresh` 成员（转发接线）', () => {
+    // ⚠️⚠️ 2026-10-20 修正的实测缺陷形态：`be42b25`（「装配 20 分钟模型目录刷新器」）
+    //    给 `createModelCatalog` 的 **config** 加了 `refresh` 回调，但**各家适配器
+    //    都没有**把它转发成自己的 `refresh` 成员；而 `index.ts` 的刷新器调的是
+    //    `adapter.refresh?.()` —— `pruned()` 的 Proxy 只透传适配器**自己的**成员，
+    //    catalog 实例上的成员不会自动出现 ⇒ 每一轮都是「0 家参与」，
+    //    而 `start()` 的「模型目录刷新器已武装」照打、**零日志**、整整一天无感。
+    //
+    // ⚠️ 判据是**实例成员**（构造真实适配器、看 `typeof`），**不是**源码文本断言 ——
+    //    后者会被 `if (false)` 短路骗过（本仓库已实测 5 条这类判据恒绿）。
+    // ⚠️ 从 `CASES` 遍历 ⇒ 新增 provider 自动纳入（漏一家即被点名）。
+    // ⚠️ `catalog` 无 `refresh` 的家自动跳过：那表示它的目录不走共享骨架
+    //    （opencode / autoclaw / officeace / modelscope / aggregate），
+    //    或它的 `createModelCatalog` 没给 config 回调（cline / gemini）
+    //    —— 后者是**已知的、已如实登记的**独立缺口，不在本条判据的范围内。
+    //    ⚠️ 2026-10-20：**qoder / qodercn 已补齐**（接入远端目录的同时补了
+    //    `refresh` 转发与 `onCatalogLoaded` 广播）⇒ 从「已知缺口」名单移出、
+    //    进下面的正向点名表。12 → 14。
+    //
+    // ⚠️⚠️ **本条只覆盖「成员存在」，抓不到「成员在但空转」**（2026-10-20 对抗审计
+    //    实测：把 `refresh()` 方法体清空成 no-op 后，本文件 **49 passed 全绿**）——
+    //    而它引用的 `be42b25` 历史缺陷恰恰是「空转 + 零日志」。
+    //    ⇒ **不要**把这条当成「转发语义成立」的证明：行为面（`refresh()` 真的会
+    //    驱动一次目录读取）由**各家自己的** `refresh` 用例承担，例如
+    //    `qoder-adapter.spec.ts` 的「refresh() 强制重拉（无视 TTL）」。
+    //    该行为断言无法在本文件通用化：`CASES` 的多数构造**不注入**
+    //    `fetchRemoteModels`（注入了就会真发网络，见 accio 那行的注释），
+    //    因此没有可观测的取数入口。⇒ 本条**如实收窄为存在性判据**。
+    const missing: string[] = []
+    const forwarding: string[] = []
+    for (const c of CASES) {
+      const adapter = c.make() as {
+        catalog?: { refresh?: unknown }
+        refresh?: unknown
+      }
+      if (typeof adapter.catalog?.refresh !== 'function') continue
+      if (typeof adapter.refresh === 'function') forwarding.push(c.id)
+      else missing.push(c.id)
+    }
+    expect(
+      missing,
+      '这些家的 catalog 有 refresh 却没转发成适配器成员 ⇒ 后台目录刷新器对它们空转且零日志',
+    ).toEqual([])
+    // ⚠️⚠️ **反向护栏必须「逐家点名」，不能只写 `length >= N`**（2026-10-20）：
+    //    上面那条 `missing` 判据有个**盲区** —— 若某人把某家的 `config.refresh`
+    //    也删掉，该家的 `catalog.refresh` 就不存在 ⇒ 被 `continue` 跳过 ⇒
+    //    **静默放过**。逐家点名把「漏转发」与「连 config 都没给」两个方向一起堵住。
+    //    ⚠️ 用精确集合而不是下界：下界会漏掉「删一家、加一家」的配平。
+    //    ⚠️ `minimaxintl` 与 `workbuddy` 也在列：它们分别与 `minimax` / `buddy`
+    //       **共用适配器类**，因此同样继承了 config 回调与转发（实测由本断言自己找出）。
+    expect(
+      forwarding.sort(),
+      '这 14 家必须都接入后台刷新（改这条名单前请先读 be42b25 与本轮修正的注释）',
+    ).toEqual([
+      'accio', 'astudio', 'buddy', 'codearts', 'lobsterai', 'loomy',
+      'minimax', 'minimaxintl', 'qoder', 'qodercn', 'raccoon', 'trae', 'workbuddy', 'zcode',
+    ])
   })
 
   /**

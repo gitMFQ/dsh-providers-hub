@@ -118,6 +118,69 @@ export function autoclawExpiresAtMs(
 }
 
 /**
+ * 从 access_token（JWT）里解出**权威**过期时刻（毫秒）。
+ *
+ * ## ⚠️⚠️ 为什么必须有这个函数（2026-10-19 真实报障，P0）
+ *
+ * AutoClaw 的 access_token 是**明文 JWT**，`exp` 可读，且网关就按它判
+ * （2026-10-19 实测三个真实账号：`iat` → `exp` 恰好 86400s，死线一到
+ * 钱包端点立刻回 `code 410000`）。而登录响应**可能根本不带**
+ * `expires_at` / `expires_in` ⇒ 旧实现在 `autoclaw-oauth.ts` 里**编造**
+ * 了 `Date.now() + 7 * 86400_000`（7 天）。
+ *
+ * 编造多出的 6 天让**两个决定「要不要续期」的判据全部跳过**：
+ * 定时续期 `refreshAccountWithReconcile`（`refreshAll` 每 30 分钟一轮，
+ * lead-time 读 `AUTOCLAW_EXPIRY_ACCESSORS.expiresAtOf`）与积分按需自愈
+ * `healExpiredAccountBeforeBalance`（只在 `entry.expiresAt <= now` 时动手）
+ * 读的都是这份假值 ⇒ **过期前不自愈、过期后也不自愈**、日志零字，
+ * 用户只看到「刚启动还能看到积分、过一会儿变成登录凭据失效」。
+ *
+ * ⇒ 一律以 JWT 的 `exp` 为准；读不出来（非 JWT / 报文形状变了）才回退
+ *   上游声明值 —— **绝不编造**。
+ *
+ * ⚠️ 只读 payload 的 `exp`，**不验签**：本函数要回答的是「这份凭据什么时候
+ *   失效」，而上游网关自己也只按 `exp` 判；验签在这里没有判据价值。
+ */
+export function autoclawJwtExpiresAtMs(accessToken: string | undefined): number | undefined {
+  if (typeof accessToken !== 'string') return undefined
+  const token = cleanBearerToken(accessToken)
+  if (token.length === 0) return undefined
+  const parts = token.split('.')
+  // JWS 紧凑序列化**必须三段**：段数不足说明根本不是 JWT（如 `at_secret_token_123`）。
+  if (parts.length !== 3) return undefined
+  try {
+    const payloadB64 = parts[1].replace(/-/g, '+').replace(/_/g, '/')
+    // ⚠️ 逐字对齐 `autoclaw-oauth.ts` 的 `probeAutoclawLocalCredential` 既有写法
+    //   （同一份实现，别再写第二份 base64url 解码）。
+    const payload = JSON.parse(Buffer.from(payloadB64, 'base64').toString('utf8')) as {
+      exp?: unknown
+    }
+    const exp = payload?.exp
+    if (typeof exp !== 'number' || !Number.isFinite(exp) || exp <= 0) return undefined
+    return autoclawExpiresAtMs(exp)
+  } catch {
+    // 解码/解析异常是**回退信号**，不是错误路径：交给调用方用声明值或 undefined。
+    return undefined
+  }
+}
+
+/**
+ * access_token 的过期时刻：**JWT 的 `exp` 优先**，读不到才回退上游声明的值。
+ *
+ * 「声明值」（`expires_at` / `expires_in`）在本家被实测证明会**偏大 6 天**
+ * （见 {@link autoclawJwtExpiresAtMs} 的事故记录）⇒ 它只是兜底、不是权威。
+ *
+ * ⚠️ 返回 `undefined` 是**合法且必须保留**的结果（= 不知道）：调用方按
+ * `shouldRefreshNow(undefined) === true` 处理（宁可多刷一次，不可编造数字）。
+ */
+export function autoclawAccessTokenExpiresAtMs(
+  accessToken: string | undefined,
+  declaredExpiresAtMs: number | undefined,
+): number | undefined {
+  return autoclawJwtExpiresAtMs(accessToken) ?? declaredExpiresAtMs
+}
+
+/**
  * 解析并校验凭据。
  */
 export function parseAutoclawCredential(raw: unknown): AutoclawCredential | undefined {
@@ -165,14 +228,22 @@ export function parseAutoclawCredential(raw: unknown): AutoclawCredential | unde
   const access = cleanBearerToken(rawAccess)
   const refresh = rawRefresh === undefined ? '' : cleanBearerToken(rawRefresh)
 
-  let expiresAt: number | undefined
+  let declaredExpiresAt: number | undefined
   if (typeof cast.expires_at === 'number') {
-    expiresAt = autoclawExpiresAtMs(cast.expires_at)
+    declaredExpiresAt = autoclawExpiresAtMs(cast.expires_at)
   } else if (typeof cast.expiresAt === 'number') {
-    expiresAt = autoclawExpiresAtMs(cast.expiresAt)
+    declaredExpiresAt = autoclawExpiresAtMs(cast.expiresAt)
   } else if (typeof cast.expires_in === 'number') {
-    expiresAt = autoclawExpiresAtMs(cast.expires_in)
+    declaredExpiresAt = autoclawExpiresAtMs(cast.expires_in)
   }
+
+  // ⚠️⚠️ **JWT 的 `exp` 优先于上面任何声明值**（2026-10-19 P0）。
+  //   存量凭据里的 `expires_at` **可能正是那次「编造 7 天」写下的错值**
+  //   （用户目录里的凭据不会自己变），而纠正点必须是**每次读取** ——
+  //   这也是那批坏账号**无需重新登录**即可自愈的唯一入口：本函数一返回真死线，
+  //   下一轮 `refreshAll` 的 lead-time 判据（`shouldRefreshNow`）立刻放行，
+  //   真发一次续期后新的 JWT 死线又会落盘。
+  const expiresAt = autoclawAccessTokenExpiresAtMs(access, declaredExpiresAt)
 
   const userId =
     typeof cast.user_id === 'string' || typeof cast.user_id === 'number'
@@ -243,6 +314,12 @@ export function isAutoclawRefreshable(credential: AutoclawCredential): boolean {
 
 /**
  * 判断凭据是否已过期（或临期，预留 marginMs）。
+ *
+ * ⚠️ 读的是 `credential.expires_at`，而该字段由 {@link parseAutoclawCredential}
+ * **以 JWT 的 `exp` 为准**归一（2026-10-19 P0）⇒ 这里不需要（也不该）再解一次
+ * token；重复实现会让两个读点在报文形状变化时各自漂移。
+ * `expires_at` 缺失时判「未过期」（= 不知道，不能把可用账号判死），
+ * 「该不该续期」由 `shouldRefreshNow(undefined) === true` 那一侧兜住。
  */
 export function isAutoclawTokenExpired(
   credential: AutoclawCredential,
@@ -309,6 +386,58 @@ export function autoclawMaxTokens(
   return declared !== undefined && Number.isSafeInteger(declared) && declared > 0
     ? Math.min(floored, declared)
     : floored
+}
+
+/** {@link autoclawEffortForRequest} 的结果。 */
+export interface AutoclawEffortDecision {
+  /** 已通过校验、**可以原样上行**的档位；`undefined` = 不发该字段。 */
+  effort?: string;
+  /** 被丢弃的档位（原样，便于日志指认用户选了什么）。 */
+  dropped?: string;
+  /** 丢弃原因（`dropped` 存在时给出）。 */
+  reason?: string;
+}
+
+/**
+ * 校验用户选的思考档位能不能发给上游。
+ *
+ * ## 为什么必须本地拦截（2026-10-18 审计 P0，实测依据见下）
+ *
+ * 上游对**非法档位不报错**：`reasoning_effort` 发 `turbo` / `ultra` / `off`
+ * 三值实测**全部回 HTTP 200** 并正常跑完（`docs/audit/pr111-autoclaw-audit.md`
+ * 的取证表「非法档位值是否被拒 → ❌ 不被拒」）。而 `off` 尤其危险：宿主把
+ * 我们的「快速思考 / 深度思考 / 极限推理」三档翻译成 DSH 的**规范档位名**再回传
+ * （`low`/`high`/`max` 之外的形态都可能出现），一旦原样发出，上游**按最贵的那档**
+ * 计费与延迟 ⇒ 症状是「模型变慢了 / 变贵了」而**不是报错**，事后无从归因。
+ *
+ * ⇒ 判据：档位 ∈ 本家已声明集合 ⇒ 原样发；否则**不发** `reasoning_effort`
+ * （退回上游自己的默认档）并回报 `dropped`，由适配器打日志。
+ *
+ * ⚠️ 刻意**不「就近映射」**（把 `medium` 悄悄改成 `low`）：那是替用户决定语义，
+ * 而档位直接关联计费倍率与是否思考。
+ * ⚠️ 也刻意**不抛错**：`UNSUPPORTED_REASONING_EFFORT` 会让整轮对话失败，
+ * 而「不发这个字段」是完全可用的降级。
+ * ⚠️ 与 `astudioEffortForRequest`（`astudio.ts`）**同型同构**：两家都是
+ * 「非法值静默按最大档跑」，所以判据必须都在本地，不能指望上游拒绝。
+ *
+ * @param requested 宿主请求的档位（`undefined` = 用户未指定）。
+ * @param declared 该模型已声明的档位集合（`undefined` = 未声明任何档位）。
+ */
+export function autoclawEffortForRequest(
+  requested: string | undefined,
+  declared: readonly string[] | undefined,
+): AutoclawEffortDecision {
+  if (requested === undefined) return {}
+  const effort = requested.trim()
+  if (effort.length === 0) return {}
+  const set = declared ?? []
+  if (set.includes(effort)) return { effort }
+  return {
+    dropped: effort,
+    reason: set.length === 0
+      ? '本模型未声明任何思考档位'
+      : `本模型只声明 ${set.join('/')}`,
+  }
 }
 
 /**

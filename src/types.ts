@@ -125,6 +125,22 @@ export interface ProviderAccountEntry {
    * 缺省/0 = 用凭据里派生的初始指纹。
    */
   opencodeFingerprintGeneration?: number
+  /**
+   * **Gemini** 账号的出口代理（空/缺省 = 直连，Gitee issue IKLTZ2）。
+   *
+   * ⚠️ Gemini 全部端点（`oauth2.googleapis.com/token`、userinfo、
+   * `cloudcode-pa.googleapis.com`）都在墙外，而 undici **既不读 Windows WinINET
+   * 系统代理、也不读 `HTTP(S)_PROXY`**（除非额外开 `NODE_USE_ENV_PROXY`）⇒
+   * 「浏览器能授权、面板里账号一直不出现」正是本字段存在的理由。
+   *
+   * ⚠️ 与 `opencodeProxy` **刻意分成两个字段**而不是共用一个：两者的
+   * **语义不同**（opencode 是「多账号要分份额度」，Gemini 是「单账号能不能连通」），
+   * 共用会让「清掉 Gemini 的代理」连带清掉 opencode 的出口配置。
+   *
+   * 空串是合法值（= 用户显式清除，回到直连），**不可**用 falsy 判据把它与
+   * 「未设置」混为一谈 —— 那会让面板上的「清除代理」点了没反应。
+   */
+  geminiProxy?: string
 }
 
 /** 账号详细状态（返回给 Client 展示） */
@@ -220,6 +236,30 @@ export interface RpcCreateAccountRequest {
    * 同因，issue IKJLK3 E2）。
    */
   accioRegion?: 'cn' | 'global'
+  /**
+   * 出口代理（**仅 Gemini 需要**；Gitee issue IKLTZ2 审计 P2-1）。
+   *
+   * ## ⚠️ 为什么登录载荷要带它（真实缺陷：死锁）
+   *
+   * Gemini 的换 token 请求发生在**凭据落盘之前**，而出口代理是**账号维度**的
+   * ⇒ 它只能从池里那条**占位条目**读。于是顺序是：
+   *
+   * 1. 客户端 `account.create`（此时账号还不存在）；
+   * 2. 占位条目入库；
+   * 3. 换 token（**此刻才读代理**）。
+   *
+   * 若占位条目不带代理，墙外环境下第 3 步恒直连 ⇒ **登录恒失败**；而用户
+   * **没法给一个还不存在的账号配代理**（面板的「代理」按钮按 `accountId` 打开）
+   * ⇒ **死锁**：唯一出路是导出 `HTTPS_PROXY` 环境变量。
+   *
+   * ⚠️ 实际触发路径很常见：refresh_token 失效时用户的既定动作是
+   * 「删号重登」（面板就是这么建议的，见 `plugin-src/client/jet-hub.js`），
+   * 而重登会造一个**全新 id** ⇒ 旧号上的代理配置必然丢失。
+   *
+   * ⚠️ **只对 Gemini 有意义**，其余 provider 忽略（它们的端点不在墙外）。
+   * ⚠️ 缺省 = 空串 = 直连，与既有行为**逐字一致**。
+   */
+  geminiProxy?: string
 }
 export interface RpcCreateAccountResponse {
   accountId: string

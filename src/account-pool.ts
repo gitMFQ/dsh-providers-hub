@@ -224,6 +224,41 @@ export function sinkAccountToProviderEnd(
  * `ctx.settings` 不再允许插件注册 namespace，故改用插件自有状态文档；
  * 两者都不可用时退化为内存态，保证不抛错。
  */
+/**
+ * 把池里的代理字段读成**字符串**（**读取侧的唯一收口**）。
+ *
+ * ## ⚠️ 为什么必须有它（实测的真缺陷，独立于 IKLTZ2 审计发现）
+ *
+ * `opencodeProxy` / `geminiProxy` 都来自**用户可编辑的备份文件**，而
+ * `sanitizeAccounts`（`src/jet-hub-store.ts`）用 `{ ...candidate }` 原样透传、
+ * **不校验这两个字段的形状**（对照 `modelRateLimits`：那个已由 `isValidResetAtMs`
+ * 加固）。于是池里可能存在 `"geminiProxy": 12345`。
+ *
+ * 下游 `normalizeProxy`（`src/opencode.ts`）第一句就是 `input.trim()` ⇒
+ * 非字符串会在那里抛 `TypeError: raw.trim is not a function`：
+ *
+ * - 该账号**永久不可用**（每次请求都抛，且没有自愈路径）；
+ * - 症状与「代理配错了」同形，排障者会去看代理配置，而真因是备份里的脏数据。
+ *
+ * 实测（本机，IKLTZ2 修复期间）：`sanitizeAccounts` 原样透传 `12345`，
+ * 解析器随即抛 `raw.trim is not a function`。
+ *
+ * ## ⚠️ 为什么「读侧兜底」而不是「写侧过滤」
+ *
+ * 写侧过滤（`sanitizeAccounts` 里丢弃非法值）更彻底，但它是**全仓共享**的清洗
+ * 函数，改动会影响十家 provider 的条目落库形态。本函数是**代理专属**的收口，
+ * 影响面精确到两个读方法。
+ *
+ * ⚠️ **刻意不删键、不改盘**：读侧只保证「不崩、行为确定」—— 脏值视为「未配置」
+ * （= 直连）是最保守的降级，用户仍可在面板里重新配一次把它覆盖掉。
+ *
+ * @param value 池字段原始值（可能是任意 JSON 值）。
+ * @returns 字符串原值；非字符串（含 `undefined` / 数字 / 对象 / 数组）一律回退空串。
+ */
+export function asProxyText(value: unknown): string {
+  return typeof value === 'string' ? value : ''
+}
+
 export class AccountPool {
   /** 持久化后端；两个后端都不可用时是仅内存实现。 */
   private readonly store: JetHubStore
@@ -2290,8 +2325,7 @@ export class AccountPool {
    *
    * 与 `updateModelRateLimit` 同款：在**最新快照**上做局部合并后整体写回，
    * 避免与并发的账号操作互相覆盖。
-   */
-  async setOpencodeProxy(accountId: string, proxy: string): Promise<void> {
+   */  async setOpencodeProxy(accountId: string, proxy: string): Promise<void> {
     const accounts = this.readAccounts()
     const idx = accounts.findIndex(a => a.id === accountId)
     if (idx === -1) {
@@ -2314,7 +2348,52 @@ export class AccountPool {
   /** 读取某 opencode 账号的代理（未设置时为空串）。 */
   opencodeProxyFor(accountId: string): string {
     const entry = this.readAccounts().find(a => a.id === accountId)
-    return entry?.opencodeProxy ?? ''
+    return asProxyText(entry?.opencodeProxy)
+  }
+
+  /**
+   * 设置/清除某 **gemini** 账号的出口代理（Gitee issue IKLTZ2）。
+   *
+   * ⚠️ **刻意与 `setOpencodeProxy` 分开成两份实现**，理由与字段同款：两者的
+   * **语义不同**（opencode = 分份额度 / Gemini = 能不能连通）。共用一份会让
+   * 「清掉 Gemini 的代理」连带清掉 opencode 的出口配置，且日志/判据也会漂移。
+   *
+   * ⚠️ 空串是合法输入（用户显式清除 → 直连），故**不能**用 `if (!proxy) return`
+   * 早退（与 `setOpencodeProxy` 同款，见其注释）。清除时删键而非写空串。
+   */
+  async setGeminiProxy(accountId: string, proxy: string): Promise<void> {
+    const accounts = this.readAccounts()
+    const idx = accounts.findIndex(a => a.id === accountId)
+    if (idx === -1) {
+      this.ctx.logger?.warn?.(
+        `[jet-hub] setGeminiProxy: 账号 ${accountId} 不在账号列表中`,
+      )
+      return
+    }
+    const next = [...accounts]
+    const entry = { ...next[idx]! }
+    if (proxy.trim().length === 0) delete entry.geminiProxy
+    else entry.geminiProxy = proxy
+    next[idx] = entry
+    await this.writeAccounts(next)
+    this.ctx.logger?.info?.(
+      `[jet-hub] 账号 ${accountId} Gemini 代理 → ${proxy.trim().length === 0 ? '直连' : proxy}`,
+    )
+  }
+
+  /**
+   * 读取某 gemini 账号的代理（未设置时为空串 = 直连）。
+   *
+   * ⚠️ **必须过 `asProxyText`**（实测的同族缺陷，独立于 IKLTZ2 审计发现）：
+   * 该字段来自**用户可编辑的备份文件**，而 `sanitizeAccounts` 用 `{...candidate}`
+   * 原样透传、不校验形状 ⇒ 池里可能存在 `"geminiProxy": 12345`。下游
+   * `normalizeProxy` 第一句就是 `input.trim()` ⇒ 非字符串会在那里抛
+   * `TypeError: raw.trim is not a function`，该账号**永久不可用且无自愈**
+   * （症状与「代理配置坏了」同形，日志只有一句 TypeError）。
+   */
+  geminiProxyFor(accountId: string): string {
+    const entry = this.readAccounts().find(a => a.id === accountId)
+    return asProxyText(entry?.geminiProxy)
   }
 
   /**

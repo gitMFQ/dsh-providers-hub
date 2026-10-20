@@ -28,6 +28,10 @@
   "include": [
     "src",
     "tests/unit/jet-hub-rpc-signature.spec.ts",
+    "tests/unit/astudio-errors.spec.ts",
+    "tests/unit/astudio-auth.spec.ts",
+    "tests/unit/astudio-stream.spec.ts",
+    "tests/unit/astudio-login-credits.spec.ts",
     "tests/unit/client-registration-id.spec.ts",
     "tests/unit/dsh-host-client.ts"
   ]

@@ -13,7 +13,7 @@ import {
   checkinProviders,
 } from './credits-capabilities.js';
 import { orderAfterDrop, dropPositionFromPointer } from './account-order.js';
-import { OpencodeKeyModal, OpencodeProxyModal } from './opencode-proxy-modal.js';
+import { OpencodeKeyModal, OpencodeProxyModal, GeminiProxyModal } from './opencode-proxy-modal.js';
 // ⚠️ **本 fork 独有**（魔搭，2026-10-17 审计 P0 修复）：与 opencode 同属
 //    「不跳浏览器、手工粘贴 API Key」的 provider，故复用同一条自绘弹窗通路。
 //    ⚠️ 本 import 此前**不存在** ⇒ `modelscope-key-modal.js` 整份 140 行从未进 bundle，
@@ -863,8 +863,8 @@ function AccountCard({ account, index, order, provider, onToggle, onDelete, onRe
         className: 'dim-jh-btn',
         onClick: () => onToggle(account.id, !account.enabled),
       }, account.enabled ? '停用' : '启用'),
-      // ⚠️ 仅 opencode：出口代理与指纹轮换是该 provider **独有**的账号维度
-      // （其余 provider 没有这两项）。用 props 存在性开关而非
+      // ⚠️ 仅 opencode / gemini：出口代理是该 provider 独有的**账号维度**能力
+      // （其余 provider 没有这一项）。用 props 存在性开关而非
       // `provider === 'opencode'` 硬判断 —— 前者让 AccountCard 无需知道
       // provider 列表，也避免以后新增同类 provider 时漏改。
       // 位置在「停用」之后、「删除」之前：删除按钮带 data-kind='danger'，
@@ -872,12 +872,18 @@ function AccountCard({ account, index, order, provider, onToggle, onDelete, onRe
       onOpenProxy
         ? React.createElement('button', {
             className: 'dim-jh-btn',
-            // ⚠️ tooltip 必须解释「不设置会怎样」：看到「代理」按钮很容易
-            // 当成锦上添花，实际不设 = 与其它账号共用同一出口（同一份额度）。
+            // ⚠️ tooltip 必须解释「不设置会怎样」。两家语义不同，故按
+            // `account.geminiProxy !== undefined` 分流文案：opencode 是
+            // 「共用出口 = 共用额度」，gemini 是「出不去 = 恒连不上」。
             title: account.opencodeProxy
               ? '出口代理：' + account.opencodeProxy + '（点击修改）'
-              : '设置该账号的出口代理；不设置则与其它未设代理的账号共享本机出口 IP',
-            onClick: () => onOpenProxy(account.id, account.opencodeProxy || ''),
+              : account.geminiProxy !== undefined
+                ? '出口代理：' + (account.geminiProxy || '直连') + '（点击修改）'
+                : '设置该账号的出口代理；'
+                  + (account.geminiProxy !== undefined
+                    ? '不设置则直连本机（出不去墙外服务）'
+                    : '不设置则与其它未设代理的账号共享本机出口 IP'),
+            onClick: () => onOpenProxy(account.id, account.opencodeProxy || account.geminiProxy || ''),
           }, '代理')
         : null,
       onRotateFingerprint
@@ -2774,6 +2780,7 @@ function ProviderPanel({ provider, rpcCall }) {
    * 缺省 `cn`，与宿主 `normalizeAccioRegion` 的回落值一致（未知值也回落 `cn`）。
    */
   const [accioRegion, setAccioRegion] = React.useState('cn');
+  const [astudioLoginMethod, setAstudioLoginMethod] = React.useState('local');
   const [autoclawMode, setAutoclawMode] = React.useState('local');
   /**
    * ★ 弹窗是否开着（`false` = 关着）。
@@ -2952,6 +2959,7 @@ function ProviderPanel({ provider, rpcCall }) {
    * 两者都必须由 `provider` 驱动，任一处漏改都会得到「弹窗内容与判据不匹配」。
    */
   const accioDialog = provider === 'accio';
+  const astudioDialog = provider === 'astudio';
   const autoclawDialog = provider === 'autoclaw';
   // 支持每日签到积分的 provider 才渲染领取按钮。
   const supportsCredits = supportsDailyCheckin(provider);
@@ -3611,7 +3619,10 @@ function ProviderPanel({ provider, rpcCall }) {
       //   （`buildCreateAccountPayload` 内部分支），
       //   其余 provider 的载荷与接入预选弹窗前**逐字节相同**。
       const res = await rpcCall('account.create',
-        buildCreateAccountPayload(provider, zcodeProvider, accioRegion, autoclawMode));      accountId = res.accountId;
+        // ⚠ 两个 provider 各占一个位置参数（astudio 第 4 位、autoclaw 第 5 位），
+        //    不可合并成一个 —— 载荷字段不同，合并会静默串台（见 new-account.js）。
+        buildCreateAccountPayload(provider, zcodeProvider, accioRegion, astudioLoginMethod, autoclawMode));
+      accountId = res.accountId;
       loginUrl = res.loginUrl;
       console.log('[jet-hub] account.create ok, provider =', provider, ', accountId =', accountId);
       // ⚠ **`reused` 分支必判**：后端若声明「复用了池里已有条目、新建条目与登录 URL」，
@@ -4244,25 +4255,33 @@ function ProviderPanel({ provider, rpcCall }) {
               onClick: (event) => event.stopPropagation(),
             },
               React.createElement('h3', { className: 'dim-jh-zcDialogTitle' },
-                autoclawDialog ? '添加 AutoClaw 账号' : (accioDialog ? '添加 Accio 账号' : '添加 ZCode 账号')),
+                // ⚠ 弹窗服务四个 provider（zcode / accio / astudio / autoclaw），
+                //   各问各的东西：渠道 / 区域 / AStudio 登录方式 / AutoClaw 登录方式。
+                astudioDialog ? '添加 AStudio 账号'
+                  : autoclawDialog ? '添加 AutoClaw 账号'
+                    : (accioDialog ? '添加 Accio 账号' : '添加 ZCode 账号')),
               React.createElement('p', { className: 'dim-jh-zcDialogHint' },
-                autoclawDialog
-                  ? '请选择登录方式：可直接读取本机已安装并登录的桌面端凭据，或使用手机短信验证码快速登录。'
-                  : (accioDialog
-                      ? 'Accio 的登录页按区域分域名，且区域由服务端按账号下发 —— 登录前'
-                        + '无法自动判断。请选择该账号所属的区域，否则会打开打不开的登录页。'
-                      : '选择登录渠道后才会打开对应的认证页面。两个渠道的授权页与凭据各自独立，')),
-              (accioDialog || autoclawDialog)
+                astudioDialog
+                  ? '支持导入本机桌面端已登录会话，或在浏览器中打开三合一登录页（支持手机短信/账号密码/微信扫码）。'
+                  : autoclawDialog
+                    ? '请选择登录方式：可直接读取本机已安装并登录的桌面端凭据，或使用手机短信验证码快速登录。'
+                    : (accioDialog
+                        ? 'Accio 的登录页按区域分域名，且区域由服务端按账号下发 —— 登录前'
+                          + '无法自动判断。请选择该账号所属的区域，否则会打开打不开的登录页。'
+                        : '选择登录渠道后才会打开对应的认证页面。两个渠道的授权页与凭据各自独立，')),
+              (accioDialog || astudioDialog || autoclawDialog)
                 ? null
                 : React.createElement('p', { className: 'dim-jh-zcDialogHint' },
                     '可用 z.ai（国际）登录另一个账号。'),
               React.createElement('label', { className: 'dim-jh-zcProvider' },
-                autoclawDialog ? '登录方式' : (accioDialog ? '登录区域' : '登录渠道'),
-                // ⚠️⚠️ **原生 `<select>` 已整体删除**（2026-10-17 审计 P2 修复）。
-                //   原先此处有**三个**各自带 `style:{display:'none'}` 的 `<select>`
-                //   （autoclawMode / accioRegion / zcodeProvider），功能已由下方
-                //   **单选卡片组**接管（Windows/Electron 下原生下拉经常点不开）。
-                //   ⇒ 那三个是纯**死 DOM**：不可见、其 `onChange` 永不触发，
+                astudioDialog ? '登录方式'
+                  : autoclawDialog ? '登录方式' : (accioDialog ? '登录区域' : '登录渠道'),
+                // ⚠️⚠️ **原生 `<select>` 已整体删除**（2026-10-17 审计 P2 修复，
+                //    本次合并 astudio 侧时一并采纳 —— astudio 侧原本还留着第四个死 select）。
+                //   原先此处有**四个**各自带 `style:{display:'none'}` 的 `<select>`
+                //   （astudioLoginMethod / autoclawMode / accioRegion / zcodeProvider），
+                //   功能已由下方**单选卡片组**接管（Windows/Electron 下原生下拉经常点不开）。
+                //   ⇒ 那四个是纯**死 DOM**：不可见、其 `onChange` 永不触发，
                 //     却仍渲染出 `<option>` 并把 state 挂在上面 ——
                 //     既是维护陷阱（改 options 会让人误以为生效），
                 //     也是「一份状态两套 UI 判据」这种本仓库红线形态。
@@ -4288,15 +4307,15 @@ function ProviderPanel({ provider, rpcCall }) {
                   margin: '8px 0 16px',
                 },
               },
-                (autoclawDialog
+                (astudioDialog
                   ? [
-                      { value: 'local', label: '⚡ 一键导入本机桌面端凭据', desc: '需已在 AutoClaw 桌面端登录，自动秒级解密' },
-                      { value: 'sms', label: '📱 手机验证码快速登录', desc: '免安装桌面端，支持输入任意手机号登录' },
+                      { value: 'local', label: '⚡ 一键导入本机桌面端凭据', desc: '需已在 AStudio 桌面端登录，自动读取本地会话' },
+                      { value: 'web', label: '🌐 网页三合一快捷登录', desc: '在浏览器载体页中登录，支持手机短信/账号密码/微信扫码，免依赖桌面端' },
                     ].map((opt) => {
-                      const active = autoclawMode === opt.value;
+                      const active = astudioLoginMethod === opt.value;
                       return React.createElement('div', {
                         key: opt.value,
-                        onClick: () => setAutoclawMode(opt.value),
+                        onClick: () => setAstudioLoginMethod(opt.value),
                         style: {
                           display: 'flex',
                           alignItems: 'center',
@@ -4402,6 +4421,62 @@ function ProviderPanel({ provider, rpcCall }) {
                             )
                           );
                         })
+                  : (autoclawDialog
+                      ? [
+                          { value: 'local', label: '⚡ 一键导入本机桌面端凭据', desc: '需已在 AutoClaw 桌面端登录，自动秒级解密' },
+                          { value: 'sms', label: '📱 手机验证码快速登录', desc: '免安装桌面端，支持输入任意手机号登录' },
+                        ].map((opt) => {                          const active = autoclawMode === opt.value;
+                          return React.createElement('div', {
+                            key: opt.value,
+                            onClick: () => setAutoclawMode(opt.value),
+                            style: {
+                              display: 'flex',
+                              alignItems: 'center',
+                              gap: '10px',
+                              padding: '10px 14px',
+                              borderRadius: '6px',
+                              border: active
+                                ? '1.5px solid var(--dsw-alias-primary, #0284c7)'
+                                : '1px solid var(--dsw-alias-border-l3, rgba(128,128,128,0.25))',
+                              background: active
+                                ? 'var(--dsw-alias-primary-tint, rgba(2, 132, 199, 0.1))'
+                                : 'var(--dsw-alias-bg-layer-2, transparent)',
+                              cursor: 'pointer',
+                              transition: 'all 0.15s ease',
+                              userSelect: 'none',
+                            },
+                          },
+                            React.createElement('div', {
+                              style: {
+                                width: '14px',
+                                height: '14px',
+                                borderRadius: '50%',
+                                border: active
+                                  ? '4px solid var(--dsw-alias-primary, #0284c7)'
+                                  : '1.5px solid var(--dsw-alias-border-l2, #8b949e)',
+                                boxSizing: 'border-box',
+                                flexShrink: 0,
+                                background: active ? '#fff' : 'transparent',
+                              },
+                            }),
+                            React.createElement('div', { style: { display: 'flex', flexDirection: 'column' } },
+                              React.createElement('span', {
+                                style: {
+                                  fontSize: '13px',
+                                  fontWeight: active ? 600 : 400,
+                                  color: 'var(--dsw-alias-label-primary, inherit)',
+                                },
+                              }, opt.label),
+                              React.createElement('span', {
+                                style: {
+                                  fontSize: '11px',
+                                  color: 'var(--dsw-alias-label-tertiary, #888)',
+                                  marginTop: '2px',
+                                },
+                              }, opt.desc)
+                            )
+                          );
+                        })
                       : [
                           { value: 'bigmodel', label: '🇨🇳 BigModel（智谱开放平台，国内）', desc: '适用于 open.bigmodel.cn 国内平台账号' },
                           { value: 'zai', label: '🌐 z.ai（chat.z.ai，国际版）', desc: '适用于 z.ai 国际版账号' },
@@ -4457,7 +4532,7 @@ function ProviderPanel({ provider, rpcCall }) {
                               }, opt.desc)
                             )
                           );
-                        })))),
+                        }))))),
               React.createElement('div', { className: 'dim-jh-zcDialogActions' },
                 React.createElement('button', {
                   className: 'dim-jh-btn',
@@ -4470,7 +4545,12 @@ function ProviderPanel({ provider, rpcCall }) {
                     setPendingLogin(undefined)
                     void createAccount()
                   },
-                }, (autoclawDialog && autoclawMode === 'local') ? '确定并导入本地账号' : '确定并打开认证页'))),
+                // ⚠ 两家（astudio / autoclaw）都在「本机导入」档时改成导入语义文案，
+                //    其余档都是打开认证页。两个 provider 各判各的，不可合并。
+                },
+                (astudioDialog && astudioLoginMethod === 'local') || (autoclawDialog && autoclawMode === 'local')
+                  ? '确定并导入本地账号'
+                  : '确定并打开认证页'))),
         )),
     probeNotice
       ? React.createElement('div', {
@@ -4633,8 +4713,18 @@ function ProviderPanel({ provider, rpcCall }) {
                 // AccountCard 靠「props 存在性」决定是否渲染按钮。
                 ...(provider === 'opencode'
                   ? {
-                      onOpenProxy: (id, current) => setProxyModal({ accountId: id, current }),
+                      onOpenProxy: (id, current) => setProxyModal({ provider, accountId: id, current }),
                       onRotateFingerprint: (id) => void rotateFingerprint(id),
+                    }
+                  : {}),
+                // ⚠️ **Gemini 也要「代理」按钮**（Gitee issue IKLTZ2）：它的全部端点
+                // 都在墙外，而插件进程**不读系统代理** ⇒ 没出口就恒连不上。
+                // ⚠️ 与 opencode **刻意分成两个回调**而不是共用：两者读不同的池字段
+                //（`geminiProxy` / `opencodeProxy`）、调不同的端点前缀、共用会让
+                // 「清掉 Gemini 的代理」连带清掉 opencode 的出口配置。
+                ...(provider === 'gemini'
+                  ? {
+                      onOpenProxy: (id, current) => setProxyModal({ provider, accountId: id, current }),
                     }
                   : {}),
                 // ⚠️ **本 fork 独有**（modelscope，2026-10-17）：编辑访问令牌。
@@ -4693,7 +4783,7 @@ function ProviderPanel({ provider, rpcCall }) {
     // 整个设置页崩成白屏。仓库其它弹窗（ModelListPanel / BackupPanel /
     // ClineQuotaPanel）都是 `createElement` 形式，正是这个原因。
     proxyModal
-      ? React.createElement(OpencodeProxyModal, {
+      ? React.createElement(proxyModal.provider === 'gemini' ? GeminiProxyModal : OpencodeProxyModal, {
           // ⚠️ 传最小 ctx 门面而不是整个面板：弹窗只需要 rpc，
           // 这样它在单测/复用时不必拖上整个 ProviderPanel 的依赖。
           ctx: { rpc: (payload) => rpcCall(payload.method, payload.payload) },

@@ -30,7 +30,7 @@ import type {
   StreamChunk,
 } from '@deepseek-ai/dsh-llm'
 import { AccountPool } from './account-pool.js'
-import { createModelCatalog, type CatalogEntry, type ModelCatalog } from './model-catalog.js'
+import { createModelCatalog, isCatalogFresh, isCatalogFreshFor, type CatalogEntry, type ModelCatalog } from './model-catalog.js'
 import { RemoteCatalogGate } from './remote-catalog-gate.js'
 import { broadcastCatalogChanged } from './catalog-broadcast.js'
 import { isRaccoonExpired, type RaccoonCredential } from './raccoon.js'
@@ -213,6 +213,13 @@ export interface RaccoonAdapterOptions {
   refresh: () => Promise<void>
   /** 拉取远端模型目录；失败时适配器回退兜底表。 */
   fetchRemoteModels?: () => Promise<RaccoonRemoteModel[]>
+  /**
+   * 「现在」的注入点（**只供单测**推进 TTL；生产缺省 `Date.now()`）。
+   *
+   * ⚠️ 为何要注入：TTL 是本 Task 的核心判据，而真实时间无法在用例里推进 ——
+   *    只能靠 `sleep` 的用例会 flaky 且慢。既有同形态先例：`auto-adapter` 的 `now`。
+   */
+  now?(): number
   /** 读取图片附件的原始字节（内联为 data URL 用）。 */
   readImage?: (attachment: unknown) => Promise<{ data: Uint8Array; mediaType: string } | undefined>
   /**
@@ -406,6 +413,14 @@ export class RaccoonAdapter extends LlmAdapter {
   private readonly fallbackIndex: ReadonlyMap<string, RaccoonFallbackModel>
   /** 远端模型缓存；未拉取时为 undefined。 */
   private remoteModels: RaccoonRemoteModel[] | undefined
+  /**
+   * ⚠️ 上次**成功**读到远端目录的时刻（0 = 从未成功过）。
+   *
+   * ⚠️ 与 `remoteModels` **并存**、不是替代：`remoteModels` 存「有哪些模型」，
+   *    本字段存「何时读到的」。两者缺一都会坏：只有 `remoteModels` 则目录永不更新
+   *    （现状）；只有 `catalogAt` 则无内容可展示。
+   */
+  private catalogAt = 0
   /** 目录加载闸门：并发去重 + 失败/空结果冷却（见 `remote-catalog-gate.ts`）。 */
   private readonly catalogGate: RemoteCatalogGate
   /**
@@ -433,6 +448,17 @@ export class RaccoonAdapter extends LlmAdapter {
         // ⚠️ 未知 id 保守报 ['text']（宁可少报能力，也不报服务端可能不认的模态）。
         unknownModelInputModalities: () => ['text'] as const,
         syncCatalog: () => this.syncCatalogEntries(),
+        /**
+         * ★ **强制重拉**（供后台 20 分钟刷新器与「用户改设置」）。
+         *
+         * ⚠️ 与 `loadCatalog` 的差别：后者内部有 `isCatalogFresh` 判据 ⇒ 新鲜时**不拉**。
+         * 本回调要的是「无视新鲜度，强制拉一次」，故先清时刻再调同一个方法 ——
+         * **不另写一份拉取逻辑**（那会让两条路的上游行为分叉）。
+         */
+        refresh: async () => {
+          this.catalogAt = 0
+          await this.loadModels()
+        },
       },
     )
   }
@@ -458,6 +484,21 @@ export class RaccoonAdapter extends LlmAdapter {
    * ⚠️ **2026-10-08 Task 7a**：骨架（含上面这条理由）已上移到共享实现
    * `src/model-catalog.ts`，此处只剩委托。
    */
+  /**
+   * ★ **后台目录刷新器入口**（`src/index.ts` 的 `refreshOf` 调 `adapter.refresh?.()`）。
+   *
+   * ⚠️⚠️ 必须由适配器**显式转发** `catalog.refresh`：`ModelCatalog`（`model-catalog.ts`）
+   *    上的这个成员**不会**自动变成适配器的成员 —— `pruned()` 的 Proxy 只透传
+   *    **适配器自己的**成员（`dead-model-store.ts:748-749`）。
+   *    漏转发 ⇒ 刷新器「已武装」却对这家**空转**，且**零日志**（`refreshOf` 返回
+   *    `undefined` 时静默跳过 —— `index.ts` 的装配注释写着这件事）。
+   *    ⚠️ 与 `options.refresh`（HTTP 401 后的**凭据**重取）**不是同一件事**，
+   *    两者同名纯属巧合，**不得合并**。
+   */
+  async refresh(): Promise<void> {
+    await this.catalog.refresh?.()
+  }
+
   listAllModels(): readonly { id: string; name: string }[] {
     return this.catalog.listAllModels()
   }
@@ -510,16 +551,38 @@ export class RaccoonAdapter extends LlmAdapter {
    * 并用 {@link RemoteCatalogGate} 的冷却挡住「每模型重试一次」的放大。
    */
   private async loadModels(): Promise<RaccoonRemoteModel[]> {
-    if (this.remoteModels !== undefined) return this.remoteModels
+    // ⚠️⚠️ **两处判据都要改**（方法入口 + gate 后复查）。只改入口的话，
+    //    第二次复查会把「刚拉到的」当成陈旧而再拉一次（放大成每轮两次上游请求）。
+    //
+    // ⚠️ 判据来源：`isCatalogFresh`（`model-catalog.ts` 的**唯一**实现）；聚合
+    //    那条缓存短路（`aggregate-adapter.ts` 的 `refreshCatalog`）也走它。
+    //    ⚠️ **不是「逐字相同」**：那边另有两处本家没有的前提（`force` 与
+    //    `options.catalogTtlMs` 覆盖的 60s TTL），本家用的是 20 分钟默认周期。
+    //
+    // ⚠️ 第 ① 处（方法入口）用 `isCatalogFreshFor`：用户在 Jet Hub 改开关后要
+    //    **立即**重拉（规格 §6 的正确性要求，见 `invalidateCatalogCache`）。
+    //    ⚠️ 第 ② 处（gate 之后复查）**刻意仍用 `isCatalogFresh`**：那里问的是
+    //    「手上这份旧读数还能不能用」—— 若也判失效，一次失败的拉取会把**完整旧
+    //    目录**判成不可用 ⇒ 回落兜底表（子集）⇒ 用户看到「模型反而变少」。
+    if (this.remoteModels !== undefined
+      && isCatalogFreshFor(this.product.id, this.catalogAt, this.options.now?.() ?? Date.now())) {
+      return this.remoteModels
+    }
     const fetchRemote = this.options.fetchRemoteModels
     if (fetchRemote !== undefined) {
       await this.catalogGate.run(async () => {
         const fetched = await fetchRemote()
         if (fetched.length === 0) return false
         this.remoteModels = fetched
+        // ⚠️ **只在成功时**记时刻：失败不写，否则一次抖动会把上界刷新掉、
+        //    下轮还要等满 20 分钟才发现上游没恢复。
+        this.catalogAt = this.options.now?.() ?? Date.now()
         return true
       })
-      if (this.remoteModels !== undefined) return this.remoteModels
+      if (this.remoteModels !== undefined
+        && isCatalogFresh(this.catalogAt, this.options.now?.() ?? Date.now())) {
+        return this.remoteModels
+      }
     }
     return this.product.fallbackModels.map(fallbackToRemote)
   }

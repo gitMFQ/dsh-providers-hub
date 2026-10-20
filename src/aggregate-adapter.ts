@@ -62,6 +62,20 @@ import {
 } from './aggregate-core.js'
 import { CANONICAL_REASONING_EFFORTS, translateReasoningEffort } from './reasoning-ladder.js'
 import { registerAdapterIdempotent } from './llm-register-compat.js'
+// ⚠️ 目录落地的**广播**也只留一份实现（`catalog-broadcast.ts`）：12 家适配器都由
+//    `registerXxxLlm` 把 `broadcastCatalogChanged(ctx)` 注入成 `onCatalogLoaded`。
+//    本适配器原先**完全没有**广播 ⇒ 后台那一轮无论多久落地，客户端都不会自动重读
+//    （它在 `status === 'ready'` 时短路，只认这四个宿主事件）⇒ 用户必须自己再开一次
+//    选择器才能看到虚拟模型。见 {@link AggregateAdapter.onCatalogLanded}。
+import { broadcastCatalogChanged } from './catalog-broadcast.js'
+// ⚠️ 冷启动（目录尚未读到）时 `resolveModel` 要回**保守展示名**，必须是**同一份**
+//    规范化实现（与 `aggregate-catalog.ts` 的 `buildVirtualModels` 同源）——
+//    自己写一遍会与目录里的名字漂移（同一个模型两套名字）。
+import { canonicalDisplayName } from './canonical-models.js'
+// ⚠️ 「目录够不够新」只留**一份实现**（`model-catalog.ts` 的 `isCatalogFresh`）。
+//    本文件原先自己内联 `now - this.catalogAt < ttl`，与 9 个适配器里的同一判据
+//    构成「同一语义两套判据」（仓库红线，`docs/agent-notes/misc.md`）。
+import { isCatalogFreshFor } from './model-catalog.js'
 // ⚠️ 只导入**常量**（不导入 `createExpiryProbe`）⇒ 依赖方向仍是
 // `aggregate-adapter → aggregate-expiry → aggregate-core`，无环。
 import { WIRED_EXPIRY_PROVIDERS } from './aggregate-expiry.js'
@@ -96,6 +110,51 @@ export const AGGREGATE_TTL_MS = 60_000
  * 「目录是动态的」那条设计）。60 秒与各家自己的目录缓存同量级。
  */
 export const AGGREGATE_CATALOG_TTL_MS = 60_000
+
+/**
+ * 后台那一轮目录刷新的**放弃等待**预算（毫秒）。
+ *
+ * ## ⚠️⚠️ 为什么必须有它（`catalogRefreshInFlight` 的单向门，2026-10-18 复审实测）
+ *
+ * `startBackgroundCatalogRefresh` 的单飞标记只在 `.finally` 里清 —— 那假设了
+ * 「一轮刷新**总会结束**」。而上游会**永不 resolve**（实测：`loomy` 的目录读取
+ * 卡住时 `ctx.llm.listModels` 既不 resolve 也不 reject）⇒ `.finally` 永不执行
+ * ⇒ 标记永不清 ⇒ 此后**所有** `listModels` 都不再起后台刷新 ⇒ 目录**永久冻在
+ * 冷帧**，且**零报错**（单向门形态）。
+ *
+ * ⚠️ 修的必须是「**放弃等待**」而不是「取消」：`LlmRuntime.listModels(provider)`
+ * **只接受一个参数、没有 signal 通道**（`dsh-llm/lib/index.js` 的
+ * `async listModels(provider)`）⇒ 正在挂住的那次读取**无法中断**，`AbortSignal`
+ * 对它无效（`throwIfAborted` 只能在它**返回之后**生效）。故用
+ * {@link withBackgroundDeadline}：到点就 reject、清标记、**保留旧目录**，
+ * 被放弃的那一轮若日后真的落地，仍会正常写入并广播（不丢结果）。
+ *
+ * ⚠️ 取值与目录 TTL 同量级（60 秒）：正常一轮刷新的实测最坏值是 7 秒级
+ * （`provider=aggregate` 逐渠道读取之和），60 秒足够宽；而它同时是
+ * 「上游挂死后，用户最多等多久才能再触发一次后台读取」。
+ */
+export const AGGREGATE_BACKGROUND_REFRESH_TIMEOUT_MS = 60_000
+
+/**
+ * **冷帧**（目录尚未推导出来）时 `resolveModel` 声明的上下文窗口。
+ *
+ * ## ⚠️⚠️ 这不是「聚合模型的窗口」，是「此刻我们还不知道」时的**保守声明**
+ *
+ * `DSH` 要求每个可路由模型都声明一个**正整数**窗口：`dsh-compaction-basic` 在
+ * `info.context === undefined` 时**抛** `TargetPressureConfigError`。故冷帧也必须给值。
+ *
+ * 取 **131072（128K）**，即本仓库各渠道已声明窗口里的**下界量级**
+ * （`llm-adapter.ts` 的 `CONTEXT_WINDOWS` 最小档、`buddy` 的 `glm-5.1` 等 200K
+ * 之下的保守端）。方向是刻意的：窗口声明**偏小**的后果只是「压缩阈值提前触发」
+ * （多发一次压缩、多花一点 token），而**偏大**的后果是上下文超限被上游拒绝
+ * （整轮失败）。未知时宁可偏小。
+ *
+ * ⚠️ 与 {@link AGGREGATE_FALLBACK_CONTEXT_WINDOW}（200_000，候选窗口**都取不到**时
+ * 的语义兜底）**刻意分开**：两者是**不同的状态** —— 那个是「候选在、但没声明窗口」，
+ * 这个是「候选表还没读到」。混用会让排障者无法区分冷帧与「渠道没声明窗口」。
+ * ⇒ 它同时是冷帧元数据的**可辨识特征**（见 {@link AggregateAdapter.coldModelInfo}）。
+ */
+export const AGGREGATE_COLD_CONTEXT_WINDOW = 131_072
 
 /**
  * 取不到任何候选窗口时的**兜底**声明值。
@@ -172,6 +231,25 @@ export interface AggregateAdapterOptions {
   ttlMs?: number
   /** 目录推导缓存时长（测试用；生产用 {@link AGGREGATE_CATALOG_TTL_MS}）。 */
   catalogTtlMs?: number
+  /**
+   * 后台那一轮目录刷新的**放弃等待**预算（测试用；生产用
+   * {@link AGGREGATE_BACKGROUND_REFRESH_TIMEOUT_MS}）。
+   *
+   * ⚠️ 存在的理由只有一个：它必须是**可注入**的，否则那条「上游永不 resolve ⇒
+   * 标记永不清」的守卫用例得跑满 60 秒（本仓库明确禁止这种 flaky 判据）。
+   */
+  backgroundRefreshTimeoutMs?: number
+  /**
+   * 目录**落地**（后台那一轮成功写入 `this.catalog`）后的通知钩子。
+   *
+   * ⚠️ 由 `registerAggregateLlm` 注入为 `() => broadcastCatalogChanged(ctx)`，
+   * 与其余 12 家适配器的 `onCatalogLoaded` **同一口径、同一实现**。
+   * 省略时静默不广播（单测替身常见形态）。
+   *
+   * ⚠️ **只在「目录真的变了」时调**（见 {@link AggregateAdapter.onCatalogLanded}）：
+   * 每次 `listModels` 都广播会让客户端反复重读，形成广播风暴。
+   */
+  onCatalogLanded?: () => void
   /** 临期探针（省略时用 `createExpiryProbe`；单测注入替身）。 */
   expiryProbe?: ExpiryProbe
   /**
@@ -215,6 +293,31 @@ export class AggregateAdapter extends LlmAdapter {
   private catalog: VirtualModel[] = []
   /** 上次推导时刻（目录缓存的判据）。 */
   private catalogAt = 0
+  /**
+   * 「已有一轮后台目录刷新在飞」标记（{@link startBackgroundCatalogRefresh} 的单飞闸门）。
+   *
+   * ⚠️ **不合并就会扇出**：宿主对目录的调用是高频的（选择器一开就一轮），
+   * 而每次「缓存不新鲜」都会起一轮 ⇒ 十几家渠道被反复并发读取，正是
+   * {@link AGGREGATE_CATALOG_TTL_MS} 注释里要防的形态。
+   * ⚠️ 与 `catalogAt` 的区别：那个记「上次**成功**的时刻」，本标记记「此刻有没有人在跑」
+   * ——两者不可互相推导（在飞期间 `catalogAt` 仍是旧值）。
+   *
+   * ⚠️⚠️ **它必须由「预算到期」也能清掉**（不只是 `finally`）：上游会**永不
+   * resolve**（实测 `loomy` 的目录读取挂住）⇒ `.finally` 永不执行 ⇒ 标记永不清
+   * ⇒ 后续所有 `listModels` 都不再起后台刷新 ⇒ 目录**永久冻在冷帧**且零报错。
+   * 故起一轮时同时 arm 一份**放弃等待预算**
+   * （{@link AGGREGATE_BACKGROUND_REFRESH_TIMEOUT_MS}），到期即清标记（保留旧值）。
+   */
+  private catalogRefreshInFlight = false
+  /**
+   * 在飞那一轮的**门票**（每次起轮自增）。
+   *
+   * ⚠️ 存在的唯一理由是**解决竞态**：被放弃的那一轮日后仍可能真的落地，而那时
+   * 「在飞」的可能是**新的一轮**。若被放弃的那一轮在自己的 `finally` 里无条件清标记，
+   * 就会把**新那一轮**的单飞闸门提前打开 ⇒ 又一次扇出。⇒ 只有「我这一轮仍是在飞
+   * 那一轮」时才清。
+   */
+  private catalogRefreshTicket = 0
   /**
    * **按虚拟模型**缓存的候选序（键 = 虚拟模型 id）。
    *
@@ -711,8 +814,38 @@ export class AggregateAdapter extends LlmAdapter {
    */
   async refreshCatalog(force = false, signal?: AbortSignal): Promise<VirtualModel[]> {
     const now = this.options.now?.() ?? Date.now()
-    const ttl = this.options.catalogTtlMs ?? AGGREGATE_CATALOG_TTL_MS
-    if (!force && this.catalogAt !== 0 && now - this.catalogAt < ttl) return this.catalog
+    // ⚠️ TTL **是 aggregate 自己的既有配置**（默认 {@link AGGREGATE_CATALOG_TTL_MS}
+    //    = 60s，`options.catalogTtlMs` 可覆盖），**不是**各渠道的 20 分钟
+    //    （`CATALOG_REFRESH_INTERVAL_MS`）—— 两者是不同的量，不要顺手改。
+    //    `catalogAt === 0`（从未成功推导过）由 `isCatalogFresh` 恒判陈旧，
+    //    与原先的 `this.catalogAt !== 0` 一格等价。
+    //
+    // ⚠️ 用 `isCatalogFreshFor(AGGREGATE_PROVIDER, …)`（多一个**正交**的「用户主动
+    //    失效」输入）。⚠️⚠️ **准确的因果（2026-10-19 复审订正 —— 别在这里写
+    //    「用户在面板改拒绝表 ⇒ 这个聚合目录要立刻重推」**不成立**，那句话是错的：
+    //    本函数下游只有 `buildVirtualModels(catalogs)`（`aggregate-catalog.ts`），
+    //    而它**只读各渠道目录的 `id` / `name` 与归一映射** ⇒ **完全不读拒绝表、
+    //    白名单、顺序表、排序模式** ⇒ 当前实现下改这三张表，推导结果逐字节相同。
+    //    这一腿是**语义对齐 / 兜底**：保持「凡是写入目录或门控相关表的端点都失效」
+    //    这条规则不破例（见 `jet-hub-rpc.ts` import 处的规则注释），万一将来
+    //    `buildVirtualModels` 真的依赖了它们，这里**已经**是对的。
+    //    ⇒ 那三张表**真实**影响的是 `gateOf` / `rejectedFor`、`pickerNameOf` /
+    //      `isAllDefaultsUnopened`（都每次现算、无缓存）与 `routingFingerprint()`；
+    //      「改表 ⇒ 候选序缓存失效」的**真实**机制是 `clearChoiceCache()`
+    //      （正确性另有 `routingFingerprint()` 兜底，见 `candidatesFor`）。
+    //    ⚠️ **不得**改成「失效全部渠道」：那会让改一个开关连带作废其余 11 家的
+    //    目录缓存（用户改一个开关却付出十几个上游请求）。
+    //    ⚠️ 刻意**不**把 `this.catalogAt` 置 0：那个字段另有第三个读者
+    //    `catalogReadyForBulkWrite`（判 `catalogAt === 0` 为「从未成功推导过」的冷帧）
+    //    ⇒ 置 0 会让「改完面板开关马上点『关闭聚合供应商』」被误拒。
+    if (!force && isCatalogFreshFor(
+      AGGREGATE_PROVIDER,
+      this.catalogAt,
+      now,
+      this.options.catalogTtlMs ?? AGGREGATE_CATALOG_TTL_MS,
+    )) {
+      return this.catalog
+    }
 
     // ⚠️ **中止必须在最前面查**（真实缺陷，对抗审计实测证伪 —— 这是同型缺陷的**第四处**）：
     //    本函数原先**没有 `signal` 形参**，逐渠道 `catch` 吞掉**一切**错误
@@ -773,7 +906,11 @@ export class AggregateAdapter extends LlmAdapter {
     //
     // ⚠️ 先记下**上一次**推导出的全量目录（下面的判据要用它判断「用户关的是整个 provider」）。
     const previousIds = [AGGREGATE_AUTO_MODEL, ...this.catalog.map((m) => m.key)]
-    this.catalog = buildVirtualModels(catalogs)
+    const derived = buildVirtualModels(catalogs)
+    // ⚠️ 判断「目录是否真的变了」用的是**推导结果**而不是「这次是否真读了上游」
+    //   （`refreshCatalog` 也会被 `force` 或 TTL 过期触发，而重推的可能是同一份目录）。
+    const changed = !this.sameCatalogAs(derived)
+    this.catalog = derived
     this.catalogAt = now
     // ⚠️⚠️ **目录变了 ⇒ 能力缓存与窗口缓存必须一起失效**（与目录同生命周期）。
     //
@@ -819,7 +956,58 @@ export class AggregateAdapter extends LlmAdapter {
     //   - 用户只是**逐个**关了某几个模型（黑名单没覆盖上快照）⇒ 不该被升级成整 provider 关闭。
     // ⚠️ 补写是**异步落盘**，不阻塞本次目录返回；失败只记 warn（下次推导会再试）。
     this.maintainProviderClosedState(previousIds)
+    // ⚠️⚠️ **目录落地后必须广播**（与其余 12 家适配器的 `onCatalogLoaded` 同一口径）。
+    //
+    // 不广播的后果（本条修的就是它）：客户端 `ModelCatalogDirectory` 在
+    // `status === 'ready'` 时**短路返回缓存**，只认四个宿主事件；而 Task 7 之后
+    // 后台那一轮刷新是**异步落地**的（不在任何一次 `listModels` 的调用栈上）⇒
+    // 无论它多久落地，客户端都**不会**自动重读 ⇒ 用户必须自己再开一次选择器才能
+    // 看到虚拟模型。成因与唯一实现见 `catalog-broadcast.ts`。
+    //
+    // ⚠️ **只在目录真的变了时广播**：`refreshCatalog` 也会被 TTL 过期或 `force`
+    // 触发，而重推的往往是同一份目录 —— 每轮都广播会让客户端反复重读（广播风暴）。
+    if (changed) this.onCatalogLanded()
     return this.catalog
+  }
+
+  /**
+   * 通知「目录已落地」——**唯一**出口（`broadcastCatalogChanged` 与 12 家适配器同源）。
+   *
+   * ⚠️ **失败只记日志**：目录已经写好了，因通知失败而抛错会让调用方
+   *（`listModels` 的宿主路径）以为目录加载失败 —— 与 `catalog-broadcast.ts`
+   * 自己的约定、以及 `jet-hub-rpc.ts` 的「通知失败不能反噬已落盘的开关」同一条。
+   */
+  private onCatalogLanded(): void {
+    try {
+      this.options.onCatalogLanded?.()
+    } catch (error) {
+      this.ctx.logger?.warn?.(`[aggregate] 广播目录变更失败（目录已落地，不影响可用性）：${String(error)}`)
+    }
+  }
+
+  /**
+   * 两份推导结果是否**逐条相同**（判定「目录真的变了」用）。
+   *
+   * ⚠️ 判据必须比到**候选表**，不能只比虚拟模型 id 的数量：候选增减（用户新登录
+   *    一个渠道、某渠道下架了一个 realId）同样改变目录语义，而 id 集合可能不变。
+   * ⚠️ 顺序也要比：`buildVirtualModels` 的结果顺序是**稳定**的（候选数降序、
+   *    同数按 key 升序）⇒ 同内容必然同序；不同序即不同内容。
+   */
+  private sameCatalogAs(next: readonly VirtualModel[]): boolean {
+    if (next.length !== this.catalog.length) return false
+    for (let i = 0; i < next.length; i += 1) {
+      const a = next[i]!
+      const b = this.catalog[i]!
+      if (a.key !== b.key || a.name !== b.name) return false
+      if (a.candidates.length !== b.candidates.length) return false
+      for (let j = 0; j < a.candidates.length; j += 1) {
+        const ca = a.candidates[j]!
+        const cb = b.candidates[j]!
+        if (ca.provider !== cb.provider || ca.realId !== cb.realId) return false
+        if (ca.realName !== cb.realName || ca.price !== cb.price || ca.via !== cb.via) return false
+      }
+    }
+    return true
   }
 
   /**
@@ -977,6 +1165,11 @@ export class AggregateAdapter extends LlmAdapter {
     //    且症状静默（无报错、无日志）。现两处都补齐。
     'accio',
     'autoclaw',
+    // ⚠️ astudio 有意**不进** AGGREGATE_CHANNELS（2026-10-16 定案，沿用先前取证结论）：
+    //    本家的模型目录来自上游动态 catalog，额度与失效语义（HTTP 200 + 业务 code 80000
+    //    归「需人工重新登录」终态）与聚合渠道不同；且上方注释已实证「只加本数组而不补
+    //    aggregate-expiry 的 WIRED_EXPIRY_PROVIDERS」是无效接线。两处均未补齐 ⇒ 本轮保持
+    //    不接入聚合渠道，此处不新增成员，仅留此说明防止后人误以为漏接。
   ])
 
   /**
@@ -1025,7 +1218,7 @@ export class AggregateAdapter extends LlmAdapter {
    *     —— 目录身份保持稳定（`this.catalog` 不随门控漂移，这是上面那份不变式的另一半）。
    */
   async listModels(provider: string): Promise<readonly LlmModelInfo[]> {
-    const models = await this.refreshCatalog()
+    const models = await this.catalogForListModels()
     const disabled = this.options.accountPool.disabledModelsFor(AGGREGATE_PROVIDER)
     const entries: LlmModelInfo[] = []
     if (!disabled.has(AGGREGATE_AUTO_MODEL)) entries.push(this.autoModelInfo())
@@ -1036,6 +1229,133 @@ export class AggregateAdapter extends LlmAdapter {
       entries.push({ provider, id: model.key, name: this.pickerNameOf(model), inputModalities: ['text', 'image'] })
     }
     return entries
+  }
+
+  /**
+   * 模型选择器用的目录：**缓存新鲜就同步返回；不新鲜就先返旧目录、后台补算**。
+   *
+   * ## ⚠️⚠️ 为什么不能在这里 `await refreshCatalog()`（2026-10-18，实测 7 秒）
+   *
+   * 实测排障日志：
+   * ```
+   * [buildModelCatalog] provider=aggregate 全部完成：listModels=…ms，总耗时=7028ms
+   * [buildModelCatalog] provider=loomy     全部完成：…              总耗时=6852ms
+   * ```
+   * 两者**同步出现且数值相近** ⇒ 共享同一个下游。真实机制（核对代码得出）：
+   * `refreshCatalog` 会**逐渠道 `await ctx.llm.listModels(provider)`**，即每个渠道
+   * 一次**远端目录读取**（`loomy` 的 `listModels` → `loadModels()` →
+   * `fetchRemoteModels()` 真发网络请求）。聚合的总耗时 = 各渠道目录读取之和，
+   * loomy 那 6852ms 是其中最大的一项 ⇒ 宿主 `buildModelCatalog` 里
+   * `provider=aggregate` 这一个分组就把它的选择器拖住整 7 秒，而 `auto` 这类
+   * 不需要目录的东西也被一起拖住。
+   *
+   * ⇒ `listModels` **不再等**：先播报**已知**目录（冷启动时可能只有 `auto`），
+   * 折算/读取交给后台，落地后下一次 `listModels` 自然带上它。
+   *
+   * ## 三条口径（缺一条都会让某条既有行为漂移）
+   *
+   * 1. **缓存新鲜 ⇒ 完全同步返回**（`isCatalogFresh`，与 `refreshCatalog` 的短路
+   *    **是同一个判据**）—— 常见路径（60 秒内重复打开选择器）行为与改前逐字相同；
+   * 2. **不新鲜 ⇒ 返回已知目录 + 起一次后台刷新**，**不 await**；
+   * 3. ⚠️ **后台任务必须复用 {@link refreshCatalog}**，不另写折算+读取逻辑 ——
+   *    它已经是「重新推导 + 清缓存 + 补写关闭态」的**唯一**入口，另写一份会让两条路
+   *    的上游行为分叉。
+   *
+   * ## ⚠️ 为什么**不传 signal**
+   *
+   * 后台任务没有调用方要通知（`listModels(provider)` 的契约里根本没有 signal 通道），
+   * 传了反而是错的。而不传**不会**破坏 `refreshCatalog` 里那段 abort 铁律：
+   * 那段逻辑由 `signal?.throwIfAborted()` 与 `isAbortLike(error, signal)` 组成，
+   * `signal` 为 `undefined` 时两者都**静默不做任何事** ⇒ 逐渠道真实的读取失败仍照旧
+   * 只记 warn 并跳过（既有语义），AbortError 也不会被误吞成目录缓存 —— 因为**没有**
+   * AbortError 可言（没有 signal 就没有取消源）。
+   *
+   * ## ⚠️ 单飞（不得并发两次）
+   *
+   * 选择器可能在后台那一轮还没跑完时被再开一次（宿主对目录的调用是高频的）。
+   * 若每次不新鲜都起一轮，就会对**十几个渠道**并发扇出（正是
+   * `AGGREGATE_CATALOG_TTL_MS` 注释里要防的形态）⇒ 必须靠 {@link catalogRefreshInFlight}
+   * 合并成一轮。
+   *
+   * ## 行为代价（如实登记）
+   *
+   * 冷启动（或距上次成功读取超过 60 秒）后的**第一次**打开选择器，聚合分组里
+   * 可能**只有 `auto`**，虚拟模型会在后台读取完成后出现（用户再开一次即见）。
+   * 这是「目录不再同步等上游」的必然代价，与 `auto-adapter.ts` 的
+   * `resolveModel` 那次修复（实测 70 秒）同一取舍。
+   */
+  private async catalogForListModels(): Promise<readonly VirtualModel[]> {
+    const now = this.options.now?.() ?? Date.now()
+    // ⚠️ 与 `refreshCatalog` **同一个判据**（含 `isCatalogFreshFor` 的失效腿）——
+    //    两处若不一致，用户改完面板开关后 `refreshCatalog` 想去重推、而这里却
+    //    认为「还新鲜、不必起后台那一轮」⇒ 失效形同虚设。
+    //    ⚠️ 本方法**无论新鲜与否都返回旧目录**（`this.catalog`）⇒ 用带失效的判据
+    //    不会让用户看到内容变少，只是多起一次后台推导。
+    if (isCatalogFreshFor(
+      AGGREGATE_PROVIDER,
+      this.catalogAt,
+      now,
+      this.options.catalogTtlMs ?? AGGREGATE_CATALOG_TTL_MS,
+    )) {
+      return this.catalog
+    }
+    this.startBackgroundCatalogRefresh()
+    return this.catalog
+  }
+
+  /**
+   * 起一轮后台目录刷新（幂等：已有在跑的一轮就**不**再起）。
+   *
+   * ⚠️ 见 {@link catalogForListModels}：**必须复用** {@link refreshCatalog}。
+   * ⚠️ **必须 `.catch()`**：这是 fire-and-forget，未捕获的 rejection 会变成
+   *    unhandled rejection 并可能打崩进程（与注册预热同一口径）。
+   * ⚠️ 清在飞标记：失败后下一轮 `listModels` 必须仍能再试一次
+   *    （否则一次瞬时失败会把目录**永久**冻在空目录上 —— 那是本仓库反复修过的
+   *    「单向门」形态）。
+   *
+   * ## ⚠️⚠️ 「清标记」必须有**两条**路径：settle 与**预算到期**
+   *
+   * 初版只有 `.finally`，即假设「一轮刷新**总会结束**」。上游会**永不 resolve**
+   * （实测 `loomy` 的目录读取挂住）⇒ `.finally` 永不执行 ⇒ 标记永不清 ⇒
+   * 此后**所有** `listModels` 都不再起后台刷新 ⇒ 目录永久冻在冷帧，零报错。
+   *
+   * ⇒ 这里同时 arm 一份放弃等待预算（{@link withBackgroundDeadline}）：
+   * - **settle**（成功或失败）⇒ 清标记、正常返回；
+   * - **预算到期** ⇒ 清标记、记一条 warn、**保留旧目录**。被放弃的那一轮若日后
+   *   真的落地，仍会正常写 `this.catalog` 并广播（不丢结果）。
+   *
+   * ⚠️ 清标记时比对 {@link catalogRefreshTicket}：被放弃那一轮的 `.finally` 迟到时，
+   *   绝不能把**新那一轮**的单飞闸门提前打开（那会重新引入扇出）。
+   */
+  private startBackgroundCatalogRefresh(): void {
+    if (this.catalogRefreshInFlight) return
+    this.catalogRefreshInFlight = true
+    const ticket = ++this.catalogRefreshTicket
+    /** 只有「我这一轮仍是在飞那一轮」时才清标记（见方法头最后一段）。 */
+    const releaseIfCurrent = (): void => {
+      if (this.catalogRefreshTicket !== ticket) return
+      this.catalogRefreshInFlight = false
+    }
+    const budgetMs = this.options.backgroundRefreshTimeoutMs ?? AGGREGATE_BACKGROUND_REFRESH_TIMEOUT_MS
+    void withBackgroundDeadline(this.refreshCatalog(), budgetMs).then(
+      // ⚠️ `.then(onOk, onErr)` 而不是 `.then().catch().finally()`：后者的 `finally`
+      //    在「预算到期」时**也会**跑到（那正是我们要的「两条路径都清」），但也意味着
+      //    迟到的真实结果会在标记已清之后再写一次 —— 那是**无害**的（目录本就该更新）。
+      //    这里显式分开两条，是为了让「到期」与「失败」的日志可区分。
+      () => { releaseIfCurrent() },
+      (error: unknown) => {
+        // ⚠️ 到期时**不**把旧目录清空（后台刷新失败保留旧值，这是本适配器的既有口径）。
+        if (isBackgroundDeadlineError(error)) {
+          this.ctx.logger?.warn?.(
+            `[aggregate] 后台刷新目录超过 ${budgetMs}ms 仍未返回，本轮放弃等待`
+            + '（保留当前已知目录；上游若稍后返回，其结果仍会被采用并广播）',
+          )
+        } else {
+          this.ctx.logger?.warn?.(`[aggregate] 后台刷新目录失败（不影响本次目录播报）：${String(error)}`)
+        }
+        releaseIfCurrent()
+      },
+    )
   }
 
   /**
@@ -1101,6 +1421,57 @@ export class AggregateAdapter extends LlmAdapter {
    */
   private nameOf(model: VirtualModel): string {
     return model.name
+  }
+
+  /**
+   * 聚合目录**此刻是否可用于「关闭整个供应商」这类写操作**（同步、零 IO）。
+   *
+   * ## ⚠️⚠️ 为什么必须有这个探测（Critical：`provider.setEnabled` 的冷帧假成功）
+   *
+   * Task 7 之后 `listModels` **不再同步等上游** ⇒ 冷启动时它立刻返回 `['auto']`。
+   * 而 `jet-hub-rpc.ts` 的 `fullCatalogIds` 判据是「远端读到即可」（`remoteError`
+   * 为空 ⇒ 认为成功）⇒ 用户在冷帧点「关闭聚合供应商」，黑名单只写进 `auto` 一条，
+   * `provider.setEnabled` 返回 `ok:true` / `changedCount:1`，而另外两个虚拟模型
+   * **仍然可选**。改前它必然 2000ms 超时 ⇒ `remoteError` ⇒ 走拒绝分支，所以这是
+   * **Task 7 重新打开**的 IKJW33 缺陷形态（该文件 `:6298` 的注释明文禁止它）。
+   *
+   * 同一份冷帧数据还让 `provider.status` 把 `closed` 从**安全方向**（`false`）
+   * 翻成危险方向（`true`）—— 两个端点同一个根因，故判据只留**这一处**。
+   *
+   * ## 判据：**只认「从未成功推导过」**（`catalogAt === 0`）
+   *
+   * 这是「读到的是不是完整目录」唯一**权威**的本地事实：`catalogAt` 只由
+   * `refreshCatalog` 在**跑完一轮逐渠道读取之后**写（与 `this.catalog` 同一处赋值，
+   * 两者锁定），而冷帧下上游挂住时它**永远**是 0（那正是本次要防的形态）。
+   *
+   * ### ⚠️ 为什么**不**把另两个信号算进来（都试过，都会造成更坏的误判）
+   *
+   * | 候选判据 | 看起来能挡冷帧 | 实际后果 |
+   * |---|---|---|
+   * | `catalogRefreshInFlight` | ✅ 冷帧必在飞 | 也覆盖「TTL 过期后的稳态」：`listModels` 在目录**非空**时同样会起后台刷新 ⇒ 用户点「关闭聚合」被无故拒绝，而那次关闭本来是完全正确的（旧目录里的模型全都写进黑名单了，新增的由 `maintainProviderClosedState` 补写） |
+   * | `catalog.length === 0` | ✅ 冷帧必为空 | 也覆盖「**所有渠道都未登录**」：此时聚合确实一个虚拟模型都没有，用户却再也关不掉聚合供应商（与 `provider.setEnabled` 注释里「无账号供应商永远关不掉」那条既有取舍直接冲突）；而且 `maintainProviderClosedState` 已保证「关掉后新长出来的模型会被自动补写」 |
+   *
+   * ⇒ 那些更严的判据换来的是**误报**（安全但不可用），而 `catalogAt === 0`
+   * 精确命中「读到的必然残缺」这一种状态。
+   *
+   * ⚠️ 三个条件都只读本适配器自己的内存状态：**零网络、零 await** ⇒
+   * `provider.status` 那些「常见路径零网络」的承诺不受影响。
+   *
+   * ⚠️ 不实现成 `describeCatalogHealth`：那是 cline 专用的「目录**来源**健康度」
+   *    诊断（多外部站点拼装），语义与「有没有读到」不同，混用会让两件事的判据漂移。
+   */
+  catalogReadyForBulkWrite(): { ready: boolean; reason?: string } {
+    // ⚠️ 两个字段永远同时写（见 `refreshCatalog`），这里仍显式判两次：
+    //    将来若有人只改其中一处的赋值顺序，这条探测也不会静默放行。
+    if (this.catalogAt === 0 || this.catalog.length === 0) {
+      return {
+        ready: false,
+        reason: this.catalogAt === 0
+          ? '聚合目录尚未成功推导过（冷启动 / 上游目录读取尚未返回）'
+          : '聚合目录当前为空',
+      }
+    }
+    return { ready: true }
   }
 
   /**
@@ -1179,33 +1550,77 @@ export class AggregateAdapter extends LlmAdapter {
   }
 
   /**
-   * 解析某个虚拟模型的能力元数据。
+   * 解析一个虚拟模型 —— **目录已有就用它；目录为空时立刻回保守元数据、绝不等待**。
    *
-   * ⚠️ `provider`/`id` 必须**按入参回填**（多虚拟模型下不能硬编码）：DSH 的
-   * `normalizeModelInfo` 逐字校验，不符即 `INVALID_MODEL_INFO`。
-   * ⚠️ `inputModalities` 恒含 `image`：聚合是整池，池里有能看图的渠道，如实声明；
-   * 「这次选中的渠道收不收得了图」由分发阶段改道保证。
-   * ⚠️ **档位声明规范化档位的并集**（不是候选集交集）—— 理由见下方
-   * {@link aggregateReasoningInfo} 的注释。
-   * ⚠️ **窗口声明候选集的<u>最大值</u>**（不是写死、也不是取小）——
-   * 理由与失效形态见 {@link AggregateAdapter.contextWindowFor}。
-   */
-  /**
-   * 解析一个虚拟模型。
+   * 目录**命中**时（热路径）的三条既有口径不变：
+   * - `provider`/`id` 必须**按入参回填**（DSH 的 `normalizeModelInfo` 逐字校验，
+   *   不符即 `INVALID_MODEL_INFO`）；
+   * - `inputModalities` 恒含 `image`：聚合是整池，池里有能看图的渠道，如实声明；
+   *   「这次选中的渠道收不收得了图」由分发阶段改道保证；
+   * - **档位**声明规范化档位的并集（不是候选集交集，见 {@link aggregateReasoningInfo}）；
+   * - **窗口**声明候选集的<u>最大值</u>（不是写死、也不是取小）——
+   *   理由与失效形态见 {@link AggregateAdapter.contextWindowFor}。
    *
-   * ⚠️ `signal` 是**本适配器自己加的可选第三参**（`LlmAdapter` 契约只要求前两个）——
-   *    `prepareCall` 拿得到 signal（它是第三参），把它透传到目录读取，
-   *    否则真实请求路径的取消**不生效**（见 `ensureCatalog` 的长注释）。
-   *    ⚠️ DSH 运行时直接调本方法时**不传**第三参，那是正常的（缓存命中时无需取消）。
+   * ## ⚠️⚠️ 为什么本方法**不得** `await ensureCatalog`（2026-10-18 复审 + 控制方实测）
+   *
+   * Task 7 把 `listModels` 改成「先返已知目录、读取转后台」后，排障日志里的
+   * `listModels=` 那一格确实降到 1ms —— 但**总耗时仍是 7 秒级**。原因是 DSH 的
+   * `buildModelCatalog`（`dsh-api-session-controller/lib/index.js`）的形状是：
+   *
+   * ```js
+   * const models = await ctx.llm.listModels(provider.id)          // ← 1ms（Task 7）
+   * const entries = await Promise.all(models.map(async (model) =>
+   *   ctx.llm.resolveModelInfo(provider.id, model.id)))           // ← 7 秒全在这里
+   * ```
+   *
+   * 而 `resolveModelInfo` 落到本方法，本方法原先首行就是 `await this.ensureCatalog()`
+   * ⇒ 耗时只是从 `listModels=` 那格**搬到了总耗时那格**，用户感知**没有任何改善**。
+   * 控制方实测：`listModels` 返回 `["auto"]` 用 1ms，`resolveModel` 仍跑满 407ms
+   * （上游卡住时是 7 秒）。
+   *
+   * ⇒ 与 Task 6 的 `auto-adapter.ts:393` **同构**：目录命中就用；未命中立刻返回
+   * 一份**保守元数据**并把读取转后台（复用 {@link startBackgroundCatalogRefresh}）。
+   *
+   * ## ⚠️ `prepareCall` 路径**不受影响**（发消息必须拿真实目录）
+   *
+   * `prepareCall` 自己在首行 `await this.ensureCatalog(signal)`（见该方法注释）——
+   * 那条路径有 abort 铁律，必须拿到真实目录；本方法只负责**目录加载路径**的
+   * 非阻塞。⚠️ 行为差异因此只落在「选择器首次渲染的能力元数据」上（真实代价如实
+   * 登记：冷帧下窗口声明的是 {@link AGGREGATE_COLD_CONTEXT_WINDOW} 而不是候选集的
+   * 最大值，档位暂不声明）。
+   *
+   * ## 保守元数据的三条「不撒谎」规则（见 {@link coldModelInfo}）
+   *
+   * 1. `provider`/`id` 按**入参**回填（DSH 逐字校验，否则 `INVALID_MODEL_INFO`）；
+   * 2. **不声明 `reasoning`** —— 档位表要等目录落地才知道，此刻编一份等于替用户
+   *    承诺一个可能不存在的档位；
+   * 3. 窗口给一个**具名常量**（{@link AGGREGATE_COLD_CONTEXT_WINDOW}），不声称
+   *    「目标模型的窗口是多少」。DSH 要求必须声明（`dsh-compaction-basic` 在
+   *    `info.context === undefined` 时抛 `TargetPressureConfigError`）⇒ 不能省略。
+   *
+   * ## ⚠️ abort 语义不变
+   *
+   * 原先那条 `signal?.throwIfAborted()` 在 `refreshCatalog` 的首行；冷帧**不再进**
+   * `refreshCatalog` ⇒ 必须在入口保留一次，否则「已取消的请求仍能拿到元数据」。
+   * 热路径的取消仍由 `contextWindowFor` → `capabilityOf` 的
+   * `signal?.throwIfAborted()` + `isAbortLike` 逃逸负责（未改动）。
    */
   async resolveModel(
     provider: string,
     model: string,
     signal?: AbortSignal,
   ): Promise<LlmResolvedModelInfo> {
+    // ⚠️ 中止必须在最前面查（理由见方法头最后一段）。
+    signal?.throwIfAborted()
+    // ⚠️⚠️ **目录为空 ⇒ 冷帧**：立刻回保守元数据 + 触后台读取，**不 await**。
+    //    这条判据（`this.catalog.length === 0`）与 `ensureCatalog` 的短路判据
+    //    **逐字同源** ⇒ 「已有目录」的两条路径不会给出两套答案。
+    if (this.catalog.length === 0) {
+      this.startBackgroundCatalogRefresh()
+      return this.coldModelInfo(provider, model)
+    }
     if (model === AGGREGATE_AUTO_MODEL) {
       const info = this.autoModelInfo()
-      await this.ensureCatalog(signal)
       return {
         provider,
         id: model,
@@ -1218,7 +1633,6 @@ export class AggregateAdapter extends LlmAdapter {
         reasoning: aggregateReasoningInfo(),
       }
     }
-    await this.ensureCatalog(signal)
     const virtual = this.catalog.find((entry) => entry.key === model)
     if (virtual === undefined) {
       const available = this.catalog.slice(0, 5).map((entry) => entry.key).join('、')
@@ -1240,6 +1654,39 @@ export class AggregateAdapter extends LlmAdapter {
       inputModalities: ['text', 'image'],
       context: { contextWindow: await this.contextWindowFor(model, virtual.candidates, signal) },
       reasoning: aggregateReasoningInfo(),
+    }
+  }
+
+  /**
+   * **冷帧**（目录尚未推导出来）时 `resolveModel` 的保守元数据。
+   *
+   * ## ⚠️⚠️ 「保守」的三条硬约束：**可辨识、不撒谎、不编造**
+   *
+   * | 字段 | 冷帧给什么 | 为什么是这个 |
+   * |---|---|---|
+   * | `provider` / `id` | **按入参原样回填** | DSH 的 `normalizeModelInfo` 逐字校验；不符即 `INVALID_MODEL_INFO`（整个 provider 分组变成 failure） |
+   * | `name` | 该虚拟模型的**规范化展示名** | 用与目录**同一份** `canonicalDisplayName` ⇒ 同一个模型在冷帧与热帧**同名**，不会出现「先是 `glm-5-3`、后是 `GLM-5.3`」的跳变 |
+   * | `inputModalities` | `['text', 'image']` | 与热路径同口径：聚合是整池，池里有能看图的渠道；**真正能不能收图由分发阶段改道保证**（`dispatch` 的 `imageTargets`） |
+   * | `context.contextWindow` | {@link AGGREGATE_COLD_CONTEXT_WINDOW} | DSH **强制**要求正整数（`dsh-compaction-basic` 在 `context === undefined` 时抛 `TargetPressureConfigError`）⇒ 不能省略；给一个**具名常量**且**不声称**它是目标模型的真实窗口 |
+   * | `reasoning` | **不声明**（字段缺席） | 档位表要等目录落地才知道。编一份等于替用户承诺一个可能不存在的档位（`auto-adapter.ts` 的降级路径同一取舍） |
+   * | `description` | **不给** | 同上：任何「目标是 xxx」的描述在冷帧都是编造 |
+   *
+   * ⚠️ **`auto` 与具名虚拟模型走同一份冷帧元数据**（只差 `name`）：冷帧时
+   * `this.catalog` 是空的，`auto` 的候选池也就无从谈起 —— 此时若给 `auto` 一个
+   * 更「丰富」的元数据，那只能是编的。
+   *
+   * ⚠️ **不要把本方法当成「永久降级」**：目录落地后（最长 60 秒 TTL，通常远短于
+   * 一次选择器的打开时长）下一次 `resolveModel` 就走热路径，窗口与档位都变成真值。
+   */
+  private coldModelInfo(provider: string, model: string): LlmResolvedModelInfo {
+    return {
+      provider,
+      id: model,
+      // ⚠️ `auto` 用它自己的那个名字（它不是虚拟模型，`canonicalDisplayName('auto')`
+      //    会把键原样返回成 `auto`，与热路径的「Auto（聚合 · 跨渠道）」不一致）。
+      name: model === AGGREGATE_AUTO_MODEL ? this.autoModelInfo().name : canonicalDisplayName(model),
+      inputModalities: ['text', 'image'],
+      context: { contextWindow: AGGREGATE_COLD_CONTEXT_WINDOW },
     }
   }
 
@@ -1267,14 +1714,18 @@ export class AggregateAdapter extends LlmAdapter {
   }
 
   /**
-   * 目录为空时先推导一次（避免 resolveModel 在 listModels 之前被调用时找不到模型）。
+   * 目录为空时先推导一次（避免 `prepareCall` / 面板在 `listModels` 之前被调用时找不到模型）。
    *
    * ⚠️⚠️ **必须接收并透传 `signal`**（真实缺陷，独立审计实测证伪）：
    *   本方法原先调 `this.refreshCatalog()` **不传 signal** ⇒ **真实请求路径**
-   *  （`prepareCall` → `resolveModel` → 本方法）的中止**不生效** ——
+   *  （`prepareCall` → 本方法）的中止**不生效** ——
    *   实测「取消于 50ms 仍跑满 312ms 的 `listModels` 才抛错」。
    *   此前只有 `describeCatalog`（面板路径）串了 signal，故 `refreshCatalog`
    *   自己的中止逃逸是对的，但**调用它的真实路径拿不到取消信号**。
+   *
+   * ⚠️ **2026-10-18 起本方法不再是 `resolveModel` 的调用方**（那会让目录加载
+   *    路径同步等上游 7 秒，见 `resolveModel` 的方法头）。现在的调用方只有
+   *    **发消息**与**面板**两条路径 —— 它们都**必须**拿到真实目录，故仍同步等待。
    */
   private async ensureCatalog(signal?: AbortSignal): Promise<void> {
     if (this.catalog.length === 0) await this.refreshCatalog(false, signal)
@@ -1297,6 +1748,22 @@ export class AggregateAdapter extends LlmAdapter {
     model: string,
     signal?: AbortSignal,
   ): Promise<{ model: LlmResolvedModelInfo; stream: (options: GenerateOptions) => AsyncIterable<StreamChunk> }> {
+    // ⚠️⚠️ **发消息路径必须显式拿真实目录**（2026-10-18）。
+    //
+    // 以前这一行**不存在**：`resolveModel` 自己在首行 `await this.ensureCatalog(signal)`，
+    // 于是 `prepareCall` 顺带拿到了目录。现在 `resolveModel` 为了「目录加载不得同步等
+    // 上游」**不再等待**（见其方法头），⇒ 若这里不补，`prepareCall` 会拿到**冷帧元数据**
+    // （无 `reasoning`、窗口是保守常量），而那是**请求真正要发出去的**元数据。
+    //
+    // ⇒ 这里显式等一次，且必须排在 `resolveModel` **之前**：目录没落地时
+    // `resolveModel` 走冷帧分支、直接返回保守元数据，那正是本条要避免的。
+    //
+    // ⚠️ **`signal` 必须透传**（真实缺陷，独立审计实测证伪）：`refreshCatalog` 里
+    // 逐渠道读取之间靠 `signal?.throwIfAborted()` 中止；不透传 ⇒ 用户取消后仍会把
+    // 所有渠道读完（实测「取消于 50ms 仍跑满 312ms」），且截断目录会被缓存 60 秒。
+    //
+    // ⚠️ 既有行为不变：`ensureCatalog` 只在目录**为空**时真刷新 ⇒ 热缓存下零成本。
+    await this.ensureCatalog(signal)
     // ⚠️ 关于「目录刷新后是否会服务陈旧缓存」（第 5 轮审计实测）：
     // **不会**，但**不是**因为这两行的先后顺序 —— 而是因为 `candidatesFor` **自己也调
     // `ensureCatalog()`**（其首行），故无论谁先跑都会先刷新目录。
@@ -2321,6 +2788,55 @@ function abortError(): Error {
 }
 
 /**
+ * 「后台刷新**放弃等待**到期」的专用哨兵名。
+ *
+ * ⚠️ **不得**用 `AbortError`：那条名字在 `isAbortLike` 里等于「调用方取消」，
+ * 而本情形**没有任何调用方取消**（后台任务根本没有 signal 通道，
+ * `LlmRuntime.listModels(provider)` 只接受一个参数）。混用会让日志把
+ * 「上游挂住」误报成「用户取消了请求」—— 本仓库反复修过的归因错误。
+ */
+const BACKGROUND_DEADLINE_NAME = 'AggregateCatalogDeadline'
+
+/** 该错误是否是 {@link withBackgroundDeadline} 的「放弃等待」哨兵。 */
+function isBackgroundDeadlineError(error: unknown): boolean {
+  return error !== null && typeof error === 'object'
+    && (error as { name?: unknown }).name === BACKGROUND_DEADLINE_NAME
+}
+
+/**
+ * 给一个**可放弃等待**的后台 Promise 加一份预算：超时即 reject 一个专用哨兵。
+ *
+ * ## ⚠️ 它只是「不再等」，**不是取消**
+ *
+ * 被等待的 `refreshCatalog()` 内部逐渠道 `await ctx.llm.listModels(provider)`，而
+ * `LlmRuntime.listModels` **只接受一个参数、没有 signal 通道**
+ * （`dsh-llm/lib/index.js` 的 `async listModels(provider)`）⇒ 正在挂住的那次读取
+ * **无法中断**。`AbortSignal.timeout` 在这里无效（没人检查它的 `aborted`）。
+ *
+ * ⇒ 语义只能是「调用方不等了」：**保留旧目录**、清在飞标记让下一轮可以再试，
+ * 而被放弃那一轮的结果**照样有效**（它日后 resolve 时仍会写 `this.catalog` 并广播）。
+ * 这与 `jet-hub-rpc.ts` 的 `withTimeout` 同一口径（那里也明确写了「不取消底层请求」）。
+ *
+ * ⚠️ 定时器必须 `unref()`：这是宿主常驻进程里的后台任务，一个 60 秒的
+ *    pending 定时器不该拖住宿主退出（与 `auto-checkin.ts` 同约定）。
+ */
+function withBackgroundDeadline<T>(work: Promise<T>, ms: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      const error = new Error(`aggregate: 后台目录刷新超过 ${ms}ms 仍未返回（放弃等待，不取消上游）`)
+      error.name = BACKGROUND_DEADLINE_NAME
+      reject(error)
+    }, ms)
+    // ⚠️ `unref` 在部分运行时不存在（如浏览器环境）⇒ 按结构化判据探测。
+    ;(timer as unknown as { unref?: () => void }).unref?.()
+    work.then(
+      (value) => { clearTimeout(timer); resolve(value) },
+      (error: unknown) => { clearTimeout(timer); reject(error) },
+    )
+  })
+}
+
+/**
  * 该错误是否是「调用方中止」类，而不是「这个候选坏了」类。
  *
  * ⚠️ 两者**必须分开**：中止时换候选会让用户在取消后仍继续跑（且最终抛出的
@@ -2353,7 +2869,19 @@ export function registerAggregateLlm(
   ctx: Context,
   options: AggregateAdapterOptions,
 ): AggregateAdapter {
-  const adapter = new AggregateAdapter(ctx, options)
+  // ⚠️ **注入目录落地广播**（Issue IKJVTF 同款接线，与其余 12 家适配器的
+  //   `onCatalogLoaded: () => broadcastCatalogChanged(ctx)` **逐字同构**）。
+  //
+  // 为什么必须在**装配层**注入而不是让适配器自己 `emit`：适配器拿不到 ctx 的
+  // 事件能力契约（12 家都靠这个注入点），且广播实现只允许有一份
+  //（`catalog-broadcast.ts`；两份实现必然漂移 —— 本仓库既有约定）。
+  //
+  // ⚠️ 调用方**显式传了** `onCatalogLanded` 时以它为准（单测替身/自定义装配用），
+  //   否则注入默认实现。不要改成「恒覆盖」：那会让替身永远收不到通知。
+  const adapter = new AggregateAdapter(ctx, {
+    ...options,
+    onCatalogLanded: options.onCatalogLanded ?? (() => broadcastCatalogChanged(ctx)),
+  })
   registerAdapterIdempotent(
     ctx.llm,
     [AGGREGATE_PROVIDER],

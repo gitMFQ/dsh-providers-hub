@@ -37,6 +37,12 @@ import {
 
 /**
  * AutoClaw 凭据 → 账号池有效期所需的提取器。
+ *
+ * ⚠️ `expiresAtOf` 只读 `credential.expires_at`，而该字段由
+ * `parseAutoclawCredential` **以 JWT 的 `exp` 为准**归一（2026-10-19 P0，
+ * 见 `src/autoclaw.ts` 的 `autoclawAccessTokenExpiresAtMs`）。
+ * 这两个入口必须**同源**：它是 `refreshAll` 的 lead-time 判据与 UI 有效期
+ * 的共同数据源 —— 曾因该字段是编造的 7 天而让整条自动续期链**静默跳过**。
  */
 const AUTOCLAW_EXPIRY_ACCESSORS: ExpiryAccessors<AutoclawCredential> = {
   expiresAtOf: (credential) => credential.expires_at,

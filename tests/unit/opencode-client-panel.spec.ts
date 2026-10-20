@@ -170,20 +170,34 @@ describe('面板文案', () => {
 })
 
 describe('弹窗必须是 React 组件（hooks 规则，真实事故 2026-10-02）', () => {
-  it('⚠️⚠️ 两个弹窗都导出为**组件**（大写命名），不是 render* 普通函数', () => {
+  it('⚠️⚠️ 三个弹窗都导出为**组件**（大写命名），不是 render* 普通函数', () => {
     // 含 useState 的函数若被直接调用，其 hook 会算进调用方组件 ⇒
     // React #310「Rendered more hooks than during the previous render」⇒ 整页白屏。
     expect(modal).toMatch(/export function OpencodeProxyModal\(/)
     expect(modal).toMatch(/export function OpencodeKeyModal\(/)
+    // ⚠️ 2026-10-18（Gitee IKLTZ2）：Gemini 也有账号出口代理弹窗
+    // （`GeminiProxyModal`）。**同样必须**是组件 —— 它内部也有 useState。
+    expect(modal).toMatch(/export function GeminiProxyModal\(/)
     expect(modal).not.toMatch(/export function renderOpencode/)
   })
 
   it('⚠️ 调用点一律用 React.createElement（不得直接函数调用）', () => {
-    expect(hub).toMatch(/React\.createElement\(OpencodeProxyModal, \{/)
     expect(hub).toMatch(/React\.createElement\(OpencodeKeyModal, \{/)
+    // ⚠️ 2026-10-18：代理弹窗改成按 provider 三元选择
+    // （`proxyModal.provider === 'gemini' ? GeminiProxyModal : OpencodeProxyModal`），
+    // 逐字串 `React.createElement(OpencodeProxyModal, {` 因此消失。
+    // ⇒ 断言改为「**createElement 的第一个实参是三元选择**，且两个弹窗都在其中」
+    // —— 这比逐字串更强：它同时锁住「用了 createElement」与「没漏掉任一弹窗」。
+    expect(hub).toMatch(
+      /React\.createElement\(\s*proxyModal\.provider\s*===\s*'gemini'\s*\?\s*GeminiProxyModal\s*:\s*OpencodeProxyModal,\s*\{/,
+    )
     // 直接调用形态必须消失
     expect(hub).not.toMatch(/\?\s*renderOpencode/)
-    expect(hub).not.toMatch(/\?\s*Opencode(?:Proxy|Key)Modal\(\{/)
+    expect(hub).not.toMatch(/\?\s*(?:Opencode|Gemini)(?:Proxy|Key)Modal\(\{/)
+  })
+
+  it('⚠️ Gemini 弹窗的宿主 facade 也由 props 传入（不得退回位置参数）', () => {
+    expect(modal).toMatch(/export function GeminiProxyModal\(\{ ctx,/)
   })
 
   it('⚠️ 弹窗的宿主 facade 由 props 传入（不再是位置参数）', () => {

@@ -50,8 +50,15 @@
  * 只改这一处即可；反过来，**任何漏判的 provider 都会被放行到「无弹窗」这条默认
  * 路径**——那是**降级**（少一次确认）而非**破坏**（错误的参数根本不会被发出去，
  * 见 `buildCreateAccountPayload`），失败方向是安全的。
+ *
+ * ⚠ **两家 provider 各占一个位置参数**（2026-10-17 合并 astudio + autoclaw 时登记）：
+ *   `astudioLoginMethod`（本机导入 / 打开认证页）与 `autoclawMode`（一键导入 / 手机验证）
+ *   是**各自独立**的载荷字段，宿主 `account.create` 也**分别**读这两个键
+ *   （`jet-hub-rpc.ts` 里 `payload.astudioLoginMethod` 与 `payload.autoclawMode`），
+ *   语义不可互换 ⇒ 合并成同一个形参会静默串台（A 家选了「本机导入」发给 B 家）。
+ *   故 astudio 占第 4 位、autoclaw 占第 5 位，两个都是可选的。
  */
-const PROVIDERS_ASKING_OPTIONS = Object.freeze(['zcode', 'accio', 'autoclaw']);
+const PROVIDERS_ASKING_OPTIONS = Object.freeze(['zcode', 'accio', 'astudio', 'autoclaw']);
 
 /**
  * 该 provider 的「新建账号」是否**需要先问一句**（即是否弹预选窗）。
@@ -97,12 +104,19 @@ export function newAccountAsksChannel(provider) {
  * @param {string} provider 当前面板的 provider id
  * @param {string} [zcodeProvider] 弹窗里选的 ZCode 登录渠道（`'bigmodel'` / `'zai'`）
  * @param {string} [accioRegion] 弹窗里选的 Accio 登录区域（`'cn'` / `'global'`）
- * @returns {{ provider: string, zcodeProvider?: string, accioRegion?: string }}
+ * @param {string} [astudioLoginMethod] 弹窗里选的 AStudio 登录方式（`'local'` / `'web'`）
+ * @param {string} [autoclawMode] 弹窗里选的 AutoClaw 登录方式（`'local'` / `'sms'`）
+ * @returns {{ provider: string, zcodeProvider?: string, accioRegion?: string,
+ *   astudioLoginMethod?: string, autoclawMode?: string }}
  */
-export function buildCreateAccountPayload(provider, zcodeProvider, accioRegion, autoclawMode) {
+export function buildCreateAccountPayload(provider, zcodeProvider, accioRegion, astudioLoginMethod, autoclawMode) {
   // 排除法：先把「载荷里没有任何专属字段」的 provider 早退掉（方向与白名单相反）。
-  if (provider !== 'zcode' && provider !== 'accio' && provider !== 'autoclaw') return { provider };
+  if (provider !== 'zcode' && provider !== 'accio'
+    && provider !== 'astudio' && provider !== 'autoclaw') return { provider };
   if (provider === 'zcode') return { provider, zcodeProvider };
   if (provider === 'accio') return { provider, accioRegion };
+  // ⚠ 两家各返回**自己那一个**字段：绝不合并成一个字段，否则宿主读到的是
+  //    另一个 provider 的值（静默串台，且两边各自都「看起来传对了」）。
+  if (provider === 'astudio') return { provider, astudioLoginMethod: astudioLoginMethod ?? 'local' };
   return { provider, autoclawMode: autoclawMode ?? 'local' };
 }

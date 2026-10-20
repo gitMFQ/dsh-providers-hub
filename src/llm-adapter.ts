@@ -7,7 +7,7 @@ import {
 import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
 import { ReasoningEffortId, ToolCallId } from '@deepseek-ai/dsh-llm'
 import { AccountPool } from './account-pool.js'
-import { createModelCatalog, type CatalogEntry, type ModelCatalog } from './model-catalog.js'
+import { createModelCatalog, isCatalogFreshFor, type CatalogEntry, type ModelCatalog } from './model-catalog.js'
 import { RemoteCatalogGate } from './remote-catalog-gate.js'
 import { broadcastCatalogChanged } from './catalog-broadcast.js'
 import { nextUtc8DayStartMs } from './model-queue.js'
@@ -237,6 +237,15 @@ export interface CodeArtsAdapterOptions {
    * 向后兼容口径一致（`complete = got`）。
    */
   catalogComplete?: () => boolean | undefined
+  /**
+   * 时钟（注入以便单测推进目录 TTL；缺省 `Date.now`）。
+   *
+   * ⚠️ 只用于**目录新鲜度**（`ensureRemoteModels` 的 `isCatalogFresh`），
+   *    不用于超时/退避计时 —— 那些仍走真实时钟。
+   *    ⚠️ **buddy 是例外**：它的 `catalogGate` 也吃这个时钟（冷却与
+   *    「距上次尝试 ≥10 秒」判定都走它），所以别把本行当成全仓库通用口径。
+   */
+  now?: () => number
   fetchImpl?: typeof fetch
   chatId?: string
   sessionId?: string
@@ -420,6 +429,16 @@ const QUEUE_RETRY_DELAY_MS = 10_000
 const QUEUE_MAX_ATTEMPTS = 180
 
 /**
+ * APIG「正文哈希对不上」时**直接重发**的次数上限。
+ *
+ * 取 2：该故障是上游网关侧的瞬时状态，实测两次连续失败后第三次即可成功；
+ * 再多只是把真正的持续故障拖长，反而掩盖问题。
+ */
+const SIGNATURE_RETRY_MAX = 2
+/** 重发的退避基数：第 n 次等 n × 该值（500ms、1000ms）。 */
+const SIGNATURE_RETRY_DELAY_MS = 500
+
+/**
  * SSE 流空闲超时。CodeArts 后端 / APIG 网关对 SSE 连接有 ~60 秒无数据即
  * 断开的策略：当模型生成超长推理或大工具调用参数时，两次 chunk 之间可能
  * 静默数十秒，连接被服务端掐断后 Node undici 的 reader.read() 抛
@@ -586,7 +605,13 @@ function isQueueError(status: number, body: string): boolean {
  * 才抛 AUTH，避免把可自愈的瞬时鉴权失败暴露给用户。
  */
 function isAuthError(status: number, body: string): boolean {
-  if (status === 401 || status === 403) return true
+  if (status === 401 || status === 403) {
+    // ⚠️ 先排除「网关瞬时签名故障」（`body hash mismatch`），否则会白跑一次
+    // 凭据续期：它与 AK/SK、security_token 都无关，重发就能过（见
+    // {@link isTransientSignatureFailure} 的实测依据）。
+    if (isTransientSignatureFailure(status, body)) return false
+    return true
+  }
   return body.includes('APIG.0602') || /invalid\s+token|token\s+expired|token\s+is\s+invalid/i.test(body)
 }
 
@@ -831,6 +856,37 @@ function httpErrorCode(status: number, body: string): string {
   return `HTTP_${status}`
 }
 
+/**
+ * 华为 API 网关（APIG）**瞬时**签名故障的判据。
+ *
+ * 报文形态（用户报障 2026-10-03 的会话日志原文）：
+ * `401 APIG.0301 Incorrect IAM authentication information: calc ak sk
+ *  signature fail:body hash mismatch x-sdk-content-sha256 header`
+ *
+ * 为什么必须单独判它：这句说的是「网关收到的正文哈希 ≠ 我方
+ * `x-sdk-content-sha256` 头」，**与 AK/SK、security_token 都无关**。
+ * 本模块的签名实现（`sign.ts`）用**同一份字节**算哈希与发请求
+ * （`signRequestHuawei(…, new TextEncoder().encode(body), …)` 的入参与
+ * 传给 `fetch` 的 `body` 是同一个字符串）⇒ 本方不存在能把两者算岔的路径。
+ * ⚠️ 这一点是**读码推导**，不是逐请求实测：仓库里没有对应的探针脚本。
+ * 2026-10-19 审计已复核该不变量本身成立（空串 / 中文 / emoji /
+ * 20 万字符 / 组合字符 5 组样本的 `sha256(body)` 与头恒等），但当时引用的
+ * 「已用探针逐请求核对过」在本仓库**不存在** —— 按证据强度如实标注。
+ *
+ * 处置：直接重发（见 `SIGNATURE_RETRY_MAX`），**不要**刷新凭据 ——
+ * 凭据与此故障无关，刷新只是白跑一次网络往返；
+ * 也就不能让它落入 {@link isAuthError} 的「静默 refresh + 重发」分支。
+ *
+ * ⚠️ 判据刻意只认 `body hash mismatch`：`APIG.0301` 的另一半
+ * （`verify ak sk signature fail`）**同时覆盖真实的 AK/SK 错误**
+ * （`AGENTS.md` 记录了把 `Agent-Type` 误当签名头传入也会得到它），
+ * 按它放宽会把真凭据问题误判成瞬时故障、让用户永远等不到「请重新登录」。
+ */
+export function isTransientSignatureFailure(status: number, body: string): boolean {
+  if (status !== 401 && status !== 403) return false
+  return typeof body === 'string' && /body hash mismatch/i.test(body)
+}
+
 /** 可中止的休眠；当信号中止时立即 resolve。 */
 function delay(ms: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve) => {
@@ -938,6 +994,20 @@ export class CodeArtsAdapter extends LlmAdapter {
           efforts: [...CODEARTS_REASONING_EFFORTS],
           defaultEffort: ReasoningEffortId(CODEARTS_DEFAULT_EFFORT),
         }),
+        /**
+         * ★ **强制重拉**（供后台 20 分钟刷新器与「用户改设置」）。
+         *
+         * ⚠️ 与 `loadCatalog` 的差别：后者内部有 `isCatalogFreshFor` 判据
+         *    ⇒ 新鲜时**不拉**。本回调要的是「无视新鲜度，强制拉一次」，
+         *    故先清 `catalogAt` 再调**同一个** `ensureRemoteModels()` ——
+         *    **不另写一份拉取逻辑**（那会让两条路的上游行为分叉）。
+         *    ⚠️ `ensureRemoteModels` 的入口就是 TTL gate ⇒ 清掉 `catalogAt`
+         *    正是让它失效的承重动作（与 loomy / zcode 等家同型）。
+         */
+        refresh: async () => {
+          this.catalogAt = 0
+          await this.ensureRemoteModels()
+        },
       },
     )
   }
@@ -967,6 +1037,14 @@ export class CodeArtsAdapter extends LlmAdapter {
   private remoteComplete = false
 
   /**
+   * ⚠️ 上次**成功**读到远端目录的时刻（0 = 从未成功过）。
+   *
+   * ⚠️ 与 `remoteModels` **并存**、不是替代：`remoteModels` 存「有哪些模型」，
+   *    本字段存「何时读到的」。只有 `remoteModels` 时目录**永不刷新**（原行为）。
+   */
+  private catalogAt = 0
+
+  /**
    * 目录加载闸门：并发去重 + 失败冷却。
    *
    * ⚠ **不能省**：DSH 的 `buildModelCatalog` 对每个 provider `await listModels()`
@@ -977,26 +1055,51 @@ export class CodeArtsAdapter extends LlmAdapter {
   private readonly catalogGate: RemoteCatalogGate
 
   /**
-   * 懒加载远端模型目录。resolveModel 可能先于 listModels 被调用
-   * （如直接进入会话），此时同样触发远端拉取。
+   * 懒加载远端模型目录（**每 20 分钟**重新拉一次，用户 2026-10-18 的要求）。
+   *
+   * resolveModel 可能先于 listModels 被调用（如直接进入会话），此时同样触发远端拉取。
    */
   private async ensureRemoteModels(): Promise<void> {
     const fetchRemote = this.options.fetchRemoteModels
+    // ⚠️ `fetchRemote === undefined` 那半边**原样保留** —— 它判的是「有没有远端
+    //    可拉」（无凭据/无接线），与新鲜度是两件事。
     if (fetchRemote === undefined) return
-    // ⚠️⚠️ **短路判据是「已完整」，不是「已定义」**（issue IKJVTF 复审，审计 I3）。
+    // ⚠️⚠️ **短路判据是「已完整」+「未超 20 分钟」，不是「已定义」**
+    //    （issue IKJVTF 复审，审计 I3；TTL 由 `isCatalogFresh` 给出）。
     //
     // CodeArts 有两个独立目录端点，残缺目录**也**要落 `remoteModels`
     //（展示需要 —— 目录服务抖动时用户的模型列表不该整个消失），但那时**不能**
     // 短路：`RemoteCatalogGate` 的冷却（`retryAt` / `cooling()`）在生产里只有
     // 闸门自己那一处调用点，而它排在短路**之后** ⇒ 残缺目录一旦落缓存，
     // 冷却永远读不到、残缺永远补不齐（与 Cline 的缺陷② 完全同构）。
-    if (this.remoteComplete) return
+    //
+    // ⚠️⚠️ **加 TTL 为什么不会破坏残缺恢复**（加 TTL 前逐行核实）：
+    // TTL 那一腿是 `&&` 的**后半截**，前半截 `remoteComplete` 未变。残缺时
+    // `remoteComplete === false` ⇒ 短路判据恒为假 ⇒ **残缺目录不会被判为
+    // 「新鲜」，闸门冷却与补齐逻辑原样生效**。TTL 只让「重新拉取」变得可发生
+    // （完整目录满 20 分钟会被重新拉，倍率/目录变化能跟上），不改变残缺的纠正路径。
+    // ⇒ **未改任何合并逻辑**（两个端点各自成败仍由接线层经 `catalogComplete` 上报）。
+    // ⚠️ **TTL 那一腿用 `isCatalogFreshFor`**（带「用户主动失效」）：用户在 Jet Hub
+    //    改开关后要**立即**重拉（规格 §6 的正确性要求，见 `invalidateCatalogCache`）。
+    //    ⚠️ 本家走 `LlmAdapter` 基类、`createModelCatalog` 的 `product` 是
+    //    `{ id: PROVIDER }` ⇒ 登记的 provider id 恒为 `PROVIDER`（`codearts`），
+    //    没有「一个类服务两个站」的情况（qoder / buddy 才有）。
+    //    ⚠️ 失效腿与完整性腿是 `&&` ⇒ 失效让整条合取为假、照常进闸门；
+    //    拉取失败时**保留**旧 `remoteModels`（本方法不清它）⇒ 用户看到的仍是
+    //    上次那份完整列表，不会退化成兜底**子集**（规格 §7 的核心取舍）。
+    if (this.remoteComplete
+      && isCatalogFreshFor(PROVIDER, this.catalogAt, this.options.now?.() ?? Date.now())) {
+      return
+    }
     await this.catalogGate.run(async () => {
       const models = await fetchRemote()
       // 空目录同样算「没拿到」：既不应落缓存（否则再也拉不回来），
       // 也不应立刻重试（否则每个模型都打一次空请求）。
       if (models.length === 0) return false
       this.remoteModels = models
+      // ⚠️ **只在成功赋值后**记时刻：失败/空结果不写，否则一次抖动会把上界
+      //    刷新掉、下轮还要等满 20 分钟才发现上游没恢复。
+      this.catalogAt = this.options.now?.() ?? Date.now()
       // ⚠️ 完整性由接线层桥接的数据源上报（两来源各自的成败）。
       // 拿不到判定时退回 `got`（= 旧行为），避免把「判不出」当成「残缺」
       // 而让每个 provider 都反复重拉。
@@ -1018,6 +1121,21 @@ export class CodeArtsAdapter extends LlmAdapter {
    * 它在 `listModels` 与 `listAllModels` **两条路径上都要生效** ——
    * 故放在 `toCatalogEntry` 之前的取数回调里（`catalogEntries()`）。
    */
+  /**
+   * ★ **后台目录刷新器入口**（`src/index.ts` 的 `refreshOf` 调 `adapter.refresh?.()`）。
+   *
+   * ⚠️⚠️ 必须由适配器**显式转发** `catalog.refresh`：`ModelCatalog`（`model-catalog.ts`）
+   *    上的这个成员**不会**自动变成适配器的成员 —— `pruned()` 的 Proxy 只透传
+   *    **适配器自己的**成员（`dead-model-store.ts:748-749`）。
+   *    漏转发 ⇒ 刷新器「已武装」却对这家**空转**，且**零日志**（`refreshOf` 返回
+   *    `undefined` 时静默跳过 —— `index.ts` 的装配注释写着这件事）。
+   *    ⚠️ 与 `options.refresh`（HTTP 401 后的**凭据**重取）**不是同一件事**，
+   *    两者同名纯属巧合，**不得合并**。
+   */
+  async refresh(): Promise<void> {
+    await this.catalog.refresh?.()
+  }
+
   listAllModels(): readonly { id: string; name: string }[] {
     return this.catalog.listAllModels()
   }
@@ -1249,6 +1367,9 @@ export class CodeArtsAdapter extends LlmAdapter {
     // 鉴权失败（APIG.0602 / 401 / 403）后已刷新过凭据：避免死循环，
     // 同一次 stream() 调用最多 refresh 一次。
     let authRefreshed = false
+    // 上游网关瞬时签名故障（正文哈希对不上）已重发的次数：
+    // 与 `authRefreshed` 分开计，它**不是**鉴权失败，不该消耗续期名额。
+    let signatureRetries = 0
     // 该账号不带 benefit 包时去掉 `maas_type: benefit` 头重试一次：
     // 只试一次，避免与真实失败互相掩盖。
     let benefitHeaderDropped = false
@@ -1359,6 +1480,28 @@ export class CodeArtsAdapter extends LlmAdapter {
         }
       } else {
         const errorText = await response.text().catch(() => '')
+        // 上游网关瞬时签名故障（`APIG.0301 … body hash mismatch`）：直接重发。
+        //
+        // 为什么值得自动重发：这是用户可见的一次性失败 —— 2026-10-03 用户报障
+        // 「华为的还是用不了」，会话日志里两次 401（13:55、15:23）都带着
+        // `APIG.0301 … body hash mismatch`，而此前同一会话的 135 轮调用全部正常、
+        // 事后同一凭据重放也立刻成功。也就是说这一次失败**本来重发就能过去**，
+        // 原实现却把它当凭据问题（先白刷一次凭据、再报「API 密钥无效」）。
+        if (isTransientSignatureFailure(response.status, errorText) && signatureRetries < SIGNATURE_RETRY_MAX) {
+          // ⚠️ **abort 后必须立刻停手**（2026-10-19 审计 I1）。`delay()` 在信号
+          // 中止时是**静默 resolve**（不是 reject），若不判就直接 `continue`，
+          // 循环会回到顶部**再发一次完整请求** —— 用户已经按了「停止」，网关
+          // 却还在收请求（实测：基线 abort 后恒 2 次，加了这条重发后涨到 3 次）。
+          //
+          // ⚠️ 与下方排队路径 L1571 的 `if (options.signal?.aborted) throw` 是
+          // **同一处置**，不是两份判据：排队与签名重发都要在退避后复检信号。
+          if (options.signal?.aborted) {
+            throw new LlmError('codearts: request aborted while retrying after a transient gateway signature failure', 'ABORTED')
+          }
+          signatureRetries += 1
+          await delay(SIGNATURE_RETRY_DELAY_MS * signatureRetries, options.signal)
+          continue
+        }
         // 鉴权失败（SecurityToken 过期/被吊销/APIG.0602）：刷新一次凭据后
         // 重试整个 chat 请求。入口的 expires_at 预判无法覆盖后端提前吊销
         // 或时钟偏差场景，这里做兜底，避免把可自愈的鉴权失败抛给用户。
@@ -1452,8 +1595,32 @@ export class CodeArtsAdapter extends LlmAdapter {
               await this.options.accountPool.updateModelRateLimit(
                 currentAccountId, parsed.modelId, parsed.resetTimeMs,
               )
+              /**
+               * ⚠️⚠️ **必须把首号加进 `rateLimitTried`**（2026-10-18 审计补齐）。
+               *
+               * 这一格原先**既没加首号、也没把 `rateLimitTried` 传给池** —— 两处都漏。
+               * 加首号是**承重**的：它是「本轮已试过」的记账，
+               * 漏了它 ⇒ 首次 429 换号时排除集为空 ⇒ 池按手动顺序**把刚失败的
+               * 首号再返回一次** ⇒ `rateLimitTried.has` 命中 → **换号立即终止**
+               * ⇒ 报「所有账号均受限」而池里其实有可用账号。
+               *
+               * ⚠️ 与同文件 `:1323`（SSE 额度格）、`:1393`（HTTP 额度格）**同型** ——
+               * 那两格一直都有这一行，只有本格漏了。
+               */
+              rateLimitTried.add(currentAccountId)
             }
-            const next = await this.options.accountPool.getAvailableAccount<CodeArtsCredential>('codearts', options.model)
+            // ⚠️ 必须传 `rateLimitTried`（⚠️⚠️ **2026-10-18 修复：这一行原先漏传**）
+            // —— 池按用户手动顺序返回候选，**刚被标记的账号可能仍排第一**
+            // （模型级过滤命中时不会，但 `parsed.resetTimeMs` 若落在
+            // `modelIds` 之外、或标记与本模型键不一致时就挡不住）⇒ 拿回同一个
+            // ⇒ 命中下面的 `rateLimitTried.has` 而立即放弃换号，报
+            // 「所有账号均受限」而池里其实有可用账号。
+            // 与同文件 `:1331`（额度耗尽换号）、`:1395` 两处**同型同修**。
+            // 该缺陷与 2026-09-17 的 `81706da`（`excludeAccountIds` 的引入
+            // 动机）逐字同构，只是那一次漏在了这一格。
+            const next = await this.options.accountPool.getAvailableAccount<CodeArtsCredential>(
+              'codearts', options.model, rateLimitTried,
+            )
             if (next && !rateLimitTried.has(next.entry.id)) {
               rateLimitTried.add(next.entry.id)
               credential = next.credential
